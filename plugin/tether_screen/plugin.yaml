@@ -1,0 +1,9 @@
+name: tether_screen
+version: 0.1.0
+manifest_version: 2
+api_version: 1
+license: MIT
+requires_hermes: ">=0.23.0"
+description: Computer-use driver that runs Hermes's computer use on a paired tether device (its real screen, its own driver and permissions); select with computer_use.backend tether_screen
+requires_plugins: [tether]
+tags: [remote, computer-use, desktop]

@@ -1,0 +1,93 @@
+════════ glm (glm-5.2:cloud) ════════
+1) SECURITY
+- **Stolen pairing link / race condition**: An attacker who intercepts the QR code or URL can connect to the host before the legitimate device, claim the name `mac`, and verify the HMAC. The host pins the attacker's cert and burns the secret, locking out the real device. Fix: Require a 6-digit code derived from the HMAC to be displayed on the host and manually entered on the device, or require a manual UI confirmation on the host after verification.
+- **Post-handshake 256-bit suite check**: If the `SSLContext` is misconfigured and offers 128-bit suites, an attacker can force a weak handshake. If the application sends pairing HMACs *before* the post-handshake check closes the link, that data is exposed under weak crypto. Fix: Restrict the cipher suites in the `SSLContext` *before* connecting (e.g., `ctx.set_ciphers('ECDHE+AES256-GCM:ECDHE+CHACHA20')`) so weak suites are never negotiated.
+- **HMAC fingerprint context & replay**: If the TLS cert fingerprints are not sent in the clear alongside the HMAC, the host cannot verify the device's HMAC because it doesn't know which fingerprints the device saw. Furthermore, without a nonce, an attacker could replay a captured pairing message. Fix: Send the fingerprints in the clear with the HMAC, and include a fresh random nonce in the HMAC calculation.
+
+2) PROTOCOL/DESIGN FLAWS
+- **Blocking single TCP link**: One TCP connection per device means a large file transfer (up to 32MB frames) will block computer_use screenshots and terminal commands, causing the agent to stall. 
+- **Unattended device latency**: If the device's Hermes raises an approval on its own screen, and the user is remote, the command will hang until the deadline and fail. Remote control implies the device is unattended, breaking the core UX.
+- **Sleep handling**: "Fails fast" means if the Mac sleeps, the agent cannot queue actions or even know it's a temporary state, defeating "control my PC" if the device sleeps mid-session.
+
+3) HERMES PLUGIN API RISKS
+- **Device-side approvals (Q1)**: Background listener threads on the device receiving RPCs likely lack the Hermes chat session context required to raise an approval card. This could completely block device-side execution or crash the API.
+- **Provider override leakage**: If the host registers `homeport` as the terminal provider, local Hermes sessions on the host might also route local commands to the remote device, breaking the host's own local capabilities.
+- **Listener thread in gateway process**: Running a synchronous TCP listener thread in Hermes's async gateway process risks blocking the event loop or deadlocking when trying to invoke async Hermes APIs.
+- **MCP generic dispatch**: Passing MCP tool calls through a generic `device_call(name, args)` loses the rich JSON schemas and descriptions Hermes needs to use them effectively, making the agent fumble tools.
+
+4) SCOPE
+- **Cut multi-device support**: Stick to one host and one device for the demo; managing active devices and state is a time sink.
+- **Cut MCP tool forwarding**: Focus entirely on terminal, files, and computer_use. MCP forwarding is complex and adds little to the "remote control" wow-factor.
+- **Defer device-side approvals**: Run the device in YOLO/unrestricted mode for the hackathon demo and document it as a known limitation.
+- **Cut file chunking / 32MB frames**: Cap file transfers at a small size for the demo to avoid TCP multiplexing issues and save implementation time.
+
+5) The single most important change
+- **Drop the "route calls through the device's own Hermes" execution model (D3/D4)**. Instead, have the device plugin execute terminal commands via `subprocess` and computer_use via the local `cua-driver` API directly, controlled by a simple local allowlist. This completely bypasses the fatal API risk of raising approvals from a non-chat background thread (Q1), eliminates listener-thread async deadlocks, and is guaranteed to be buildable in 5 days.
+
+════════ deepseek (deepseek-v4-pro:cloud) ════════
+1) SECURITY
+- **Pairing link is a bearer token with no host identity confirmation.** An attacker sends a malicious `homeport://attacker:port/#secret` link; the device connects, completes HMAC with that secret, and pins the attacker’s cert. The attacker now owns the “host” side and can request actions from the device. Fix: require out-of-band host fingerprint confirmation (e.g., display a short verification code derived from `host_fp` and secret on both host and device, user compares) or bind the link to a pre‑trusted tailnet identity.
+- **HMAC is not bound to the TLS session transcript.** The HMAC uses cert fingerprints and name, but not the TLS 1.3 exporter value or handshake hash. An attacker who later obtains the secret (e.g., from memory, logs, or a compromised endpoint) can replay the HMAC in a new session or relay it to pair a different device. Fix: include `ssl.SSLSocket.export_keying_material("homeport-pairing", ...)` in the HMAC input.
+- **Post‑handshake 256‑bit suite check allows a race.** The link is already established before the check runs; an application could send data before the connection is closed. Fix: enforce the two allowed suites in the TLS handshake by setting `SSLContext.set_ciphers("TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256")` so negotiation fails if not 256‑bit.
+- **Stolen device private key enables impersonation until host revokes.** If the device key is stolen, the attacker can connect with the pinned cert; there is no per‑boot freshness or challenge. Fix: add a per‑boot nonce signed by the device key and verified by the host, or rotate device certs on each successful boot.
+
+2) PROTOCOL/DESIGN FLAWS
+- **Device‑side approvals for non‑chat calls are unresolved (Q1).** Hermes approvals are tied to a chat/session; a background homeport call has no session, so no approval card can be raised. This breaks D4 for any gated action (dangerous terminal commands, computer_use, MCP tools).
+- **MCP tool list is announced only at connect.** Adding or removing an MCP server/tool on the device later will not be visible to the host until the device reconnects.
+- **Framing chunking is unspecified for >32 MB.** The design says “chunked above that,” but no chunk header, reassembly, or backpressure is defined; screenshots/file chunks may be dropped or misordered.
+- **Terminal provider `execute` as remote may break file tools.** File tools likely assume local filesystem access or use `os.path`; routing them through `execute("cat …")` is inefficient and fails for binary files, symlinks, or permissions.
+- **Active device is global per session.** If multiple agents or concurrent calls on the host use the same session, `devices use mac` can be changed mid‑flight, causing commands to hit the wrong device.
+- **Device sleeps → immediate failure.** This is acceptable for v1 but will break demos if the device screen locks or the machine sleeps during a long task.
+
+3) HERMES PLUGIN API RISKS
+- **`register_terminal_environment_provider` may not honor `is_remote=True`.** File tools and other internals may ignore the flag and try to spawn local subprocesses or access local paths.
+- **`register_computer_use_provider` return types may not serialize.** Methods like `capture` return PIL images or window objects; JSON + binary blobs may lose type fidelity, causing the host provider to fail type checks.
+- **`register_tool` may not support binary return values or streaming.** `device_call` returning a screenshot as bytes may exceed tool result limits or be mangled by the tool registry.
+- **A background listener thread in the gateway process is risky.** Hermes gateway may be single‑threaded or not thread‑safe; plugin reload can orphan the thread; multiple gateway processes (CLI + Desktop) will conflict on the listen port.
+- **Approval API requires a session/chat context.** Non‑chat calls cannot raise an approval card; the device’s Hermes may not even have a Desktop attached, so the approval surface may not exist.
+
+4) SCOPE
+- **Cut multi‑device support.** Focus on one device; the “second device” day is a luxury.
+- **Cut MCP tool forwarding.** `device_tools`/`device_call` is complex and depends on the device‑side approval path; defer to v2.
+- **Cut computer_use provider if time is tight.** Terminal/files alone proves the core value; screen control can be a stretch goal.
+- **Cut asleep queue.** Fail‑fast is fine for the hackathon; a queue adds state and edge cases.
+- **Cut catalog YAML/`hermes plugins validate`.** Submission likely doesn’t require it; a README + demo video is enough.
+- **Defer device‑side approval spike if not solved by Friday.** For v1 demo, use the device’s existing “always allow” mode or pre‑approve the specific actions used in the video.
+
+5) Single most important change
+- **Solve device‑side approvals by injecting a synthetic Hermes session on the device for homeport calls.** Without a session, no approval card can be raised, D4 collapses, and the security model is false. The fix is to create a minimal in‑process session (or reuse an existing one) on the device that owns the approval context, then forward the approval result back over the link. This is the linchpin of the entire design.
+
+════════ kimi (kimi-k2.6:cloud) ════════
+1) SECURITY
+- **Hole: Pairing URL carries no host certificate anchor.** Exploit: An on-path attacker on the same LAN/Tailnet (ARP spoofing, malicious DNS, or Tailnet node compromise) stands up a fake host at the URL's IP:port. The device connects with no prior trust anchor—likely `cert_reqs=ssl.CERT_NONE` to "not trust yet"—accepts the attacker's self-signed cert, computes the HMAC using the attacker's fingerprint `A_fp`, and pins the attacker. The attacker now has a mutually trusted, persistent channel to the device and can impersonate the host forever. Fix: Append the host's certificate fingerprint (or raw Ed25519 public-key hash) to the pairing URL, e.g. `homeport://host:port/#secret#host_fp`. The device aborts TLS immediately if the presented cert does not match the URL fingerprint, *before* computing any HMAC.
+- **Hole: 128-bit secret is exposed in URI fragments and shell history.** Exploit: The secret appears in the device shell history (`~/.zsh_history`), process listings (`ps aux`), clipboard managers, Desktop UI debug logs, and the QR code plain sight. Malware with user-level access or a camera can capture the secret within the 10-minute window and race to pair a rogue machine. Fix: Replace the URL with a short human-typed pairing code (e.g., 8 characters, base32). Both sides derive the HMAC key via `HKDF-SHA256(code, salt=host_pub_key[:16])`. Never write the derived key to logs, URLs, or command arguments.
+- **Hole: Pairing HMAC lacks a nonce, enabling replay inside the expiry window.** Exploit: An on-path attacker records the device's HMAC message during a legitimate pairing and replays it to the host before the 10 minutes expire. If the host has not atomically burned the secret (e.g., across a crash or race), it accepts the replay and pairs the attacker's fingerprint. Fix: After the TLS channel is established, the host sends a random 16-byte `pairing_nonce`. Both sides compute `HMAC(secret, role ‖ host_fp ‖ device_fp ‖ name ‖ nonce)`. The host stores used nonces for the expiry duration and rejects duplicates.
+- **Hole: Manual post-handshake cipher-suite check is bypassable.** Exploit: An attacker who can trigger an exception-handling bug (e.g., by aborting the handshake at the right byte) or exploit an OpenSSL edge case (HelloRetryRequest confusion) may cause the Python code to fall through past the `cipher()` string comparison, leaving the link on a weaker suite. Fix: Remove the post-hoc check. Before `do_handshake()`, call `SSLContext.set_ciphers('TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256')` and `set_min_protocol_version(ssl.TLSVersion.TLSv1_3)`. OpenSSL will fail the handshake hard; no manual verification is needed.
+- **Hole: Long-term private keys live in a plain directory vulnerable to cloud sync.** Exploit: `HERMES_HOME/homeport/` with mode `0600` is still inside the user's home directory, which on macOS is typically in `~/Library/Application Support` (synced by Time Machine and iCloud Drive) and on Linux is often dotfiles-managed. Compromise of the user's cloud account or restoration of a backup exfiltrates the Ed25519 private key, allowing permanent impersonation of host or device. Fix: Store private keys in the OS secure keychain (macOS Keychain/SecKey, Windows DPAPI, Linux `libsecret`) rather than on-disk PEM files.
+
+2) PROTOCOL/DESIGN FLAWS
+- **Device-side approvals for non-chat calls will deadlock**: Hermes approval cards are bound to a chat `thread_id` and UI surface. Remote calls arriving via the TLS link have no conversation context. The device's `request_approval()` path will either raise an internal exception, render an orphan card that cannot be answered, or silently deny. The entire D3/D4 execution model is unimplementable on v0.23 without a new Hermes core feature.
+- **Screenshots over a single multiplexed TCP stream will stall or OOM**: A 1.5 MB screenshot blocks all other calls on the one connection. Hermes internal IPC (likely protobuf/gRPC) has default message limits (commonly 4 MB); stuffing megabyte JPEG blobs through `register_computer_use_provider` will hit serialization limits or cause JSON encoder OOMs.
+- **Sleep breaks the link and cannot be recovered by the host**: When a Mac sleeps or changes Wi-Fi, the outbound TCP dies. The host cannot wake the device because the device initiates all connections. Remote `computer_use` on a laptop is effectively limited to when the lid is open, defeating the remote-use case.
+- **Generic `device_call` without dynamic registration is invisible to the LLM**: Hermes registers tools with static JSON schemas at load time. `device_call` with a generic `name`/`args` signature gives the host LLM no schema for device-specific tools, so it cannot construct valid arguments; runtime dispatch will fail repeatedly.
+- **Terminal file tools break on remote paths**: Hermes file tools (`read_file`, `write_file`) assume local POSIX paths and direct syscalls. Routing them through a remote `execute()` provider causes path mismatches, shell-quoting errors, and binary corruption via terminal encoding.
+- **Listener thread in gateway violates Hermes event-loop safety**: Hermes gateways use asyncio or internal thread pools. A raw `threading.Thread` running a blocking TCP listener and then calling back into `ctx` to dispatch tool calls will race the event loop and likely deadlock or corrupt internal registry state.
+
+3) HERMES PLUGIN API RISKS
+- **`register_computer_use_provider` does not exist as public API in v0.23**: The spike had to abuse `HERMES_CUA_DRIVER_CMD` and `bot_desktop.placement`. If this hook is not exposed, screen forwarding is impossible without upstream patches, which will not happen in 5 days.
+- **`register_terminal_environment_provider` does not redirect file I/O**: Hermes file tools bypass the terminal provider and use direct `open()`/`read()` syscalls. Changing the terminal backend only affects `execute()`; file operations will silently target the host's local disk instead of the device's.
+- **Listener thread cannot safely invoke tool registries**: Hermes tool registries and approval systems are not thread-safe for calls from arbitrary network listener threads. The design lacks an async queue or `call_soon_threadsafe` bridge to the gateway event loop.
+- **No API to enumerate or invoke internal MCP servers from a plugin**: The device's MCP servers (e.g. a printer-settings server) are managed inside Hermes' internal MCP client. There is no `ctx.mcp_client.call_tool()` in the public plugin API, so `device_tools`/`device_call` cannot be implemented.
+- **Non-chat calls cannot raise approval cards**: Hermes' approval surface requires an active chat session ID. Plugin-mediated remote calls lack this ID, so the device cannot surface an approval prompt. D4 is architecturally incompatible with the existing API.
+
+4) SCOPE
+- **Cut MCP/skill tool forwarding (`device_tools`/`device_call`)**: Requires internal MCP registry access and dynamic tool schemas. Not needed to win; terminal + screen is enough.
+- **Cut multi-device support**: Support exactly one paired device selected at config time. Remove the `devices` tool and per-session switching logic.
+- **Cut the custom pairing/TLS handshake**: Use Tailscale for transport crypto and a simple bearer token in the `announce` frame. Burning a day on Ed25519/HMAC/pinning risks zero demo.
+- **Cut automatic reconnect/backoff**: Implement one-shot connections. For the demo, keep both machines awake; reconnection is a v2 reliability feature.
+- **Cut large-frame chunking and file transfer**: Cap screenshots to 500 KB JPEG; do not implement file tools over the link—use terminal `execute()` only.
+- **Defer device-side approval UI**: Add a hackathon-only `--insecure-auto-approve` flag on the device so remote calls execute immediately. Document that real approvals require a post-hackathon Hermes core change.
+
+5) The single most important change
+- **Replace the §5 custom TLS mutual-pinned handshake and HMAC pairing with a simple Tailscale TCP tunnel plus a 256-bit bearer token in the `announce` frame, and redeploy the saved build day to implement a device-side `--auto-approve` ACL that bypasses Hermes chat approvals.** The custom crypto is redundant to Tailscale, introduces an exploitable MITM hole, and consumes the entire first dev day; meanwhile D3/D4 approvals are impossible without a core Hermes feature that won't ship in time. A working insecure demo of remote terminal and screen beats a secure design that cannot execute a single tool call.
+

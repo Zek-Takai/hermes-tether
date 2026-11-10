@@ -1,0 +1,8 @@
+# live check v2, 2026-11-06, cua-driver 0.38.0, Claude fullscreen on Space 435, Hermes on Space 1
+start space 435 home Claude other Hermes
+  capture target at start: old -> Claude 38792 title='' | new -> Claude 38782 title='Claude'
+raise Hermes: ok=True code=bring_to_front_exact_window_verified verified=None effect=None escalation=None status=activated driver_verdict=None
+  capture target on Hermes's Space: old -> Hermes 41069 title='Hermes' | new -> Hermes 41069 title='Hermes'
+raise Claude: ok=True code=bring_to_front_focused_own_app_above verified=True effect=confirmed escalation=None status=activated driver_verdict={'code': 'bring_to_front_exact_window_unverified', 'status': 'partial', 'activated': False}
+  capture target on Claude's Space: old -> Claude 38792 title='' | new -> Claude 38782 title='Claude'
+end space 435 (start 435 )

@@ -1,0 +1,7 @@
+start: current space 435 apps on spaces {'Claude': [435], 'Hermes': [1]}
+OLD focus_app('Hermes', raise): ok=False code=None msg="No on-screen window found for app 'Hermes'."
+NEW focus_app('Hermes', no raise): ok=False code=window_on_other_space msg="'Hermes' has no window on the current Space: it is fullscreen or on another Space. focus_app with raise_window=true switches to it (a separately approved foreground action)."
+NEW focus_app('Hermes', raise): ok=True code=bring_to_front_exact_window_verified msg='Brought exact window 41069 for pid 43212 to the foreground.'
+after raise: current space 1
+NEW focus_app('Claude', raise) back: ok=False code=bring_to_front_exact_window_unverified msg="bring_to_front: exact window 38782 for pid 26756 was not verified as the frontmost process's focused window and the front window of that process on its display (request_accepted=true, process_activated=true, focused=true, front_in_process_on_display=false)."
+end: current space 435 (start was 435 )

@@ -1,0 +1,7 @@
+start: current space 435 apps on spaces {'Claude': [435], 'Hermes': [1]}
+OLD focus_app('Hermes', raise): ok=False code=None msg="No on-screen window found for app 'Hermes'."
+NEW focus_app('Hermes', no raise): ok=False code=window_on_other_space msg="'Hermes' has no window on the current Space: it is fullscreen or on another Space. focus_app with raise_window=true switches to it (a separately approved foreground action)."
+NEW focus_app('Hermes', raise): ok=True code=bring_to_front_exact_window_verified msg='Brought exact window 41069 for pid 43212 to the foreground.'
+after raise: current space 1
+NEW focus_app('Claude', raise) back: ok=True code=bring_to_front_focused_own_app_above msg="Brought Claude to the foreground: window 38782 has focus; one of the app's own windows (e.g. its fullscreen title strip) is stacked above it."
+end: current space 435 (start was 435 )

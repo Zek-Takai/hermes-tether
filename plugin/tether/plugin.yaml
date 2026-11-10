@@ -1,0 +1,24 @@
+name: tether
+label: Hermes Tether
+version: 0.1.0
+author: James Reed (developed with AI)
+manifest_version: 2
+api_version: 1
+license: MIT
+requires_hermes: ">=0.23.0"
+description: Give one remote Hermes agent the local capabilities of your paired desktop machines (terminal, files, its own tools), over a pinned, 256-bit TLS 1.3 link; every session is allowed once by the person at the machine
+provides_tools:
+  - devices
+provides_hooks:
+  - pre_llm_call
+  - post_llm_call
+  - transform_tool_result
+provides_middleware:
+  - tool_execution
+tags: [remote, devices, desktop, security]
+config_schema:
+  role: {type: string, default: "off", description: "off | host | device (both: host,device). Off does nothing."}
+  name: {type: string, default: "", description: "This device's name as the host shows it (device role)"}
+  listen: {type: string, default: "", description: "host:port the host listens on (host role); use a LAN or tailnet address"}
+  grant_idle_minutes: {type: float, default: 15, description: "Device: minutes without remote use before a session's grant lapses and the person at the machine must allow it again"}
+  consent_timeout_seconds: {type: float, default: 15, description: "Device: how long the allow/deny prompt waits; no answer means deny"}
