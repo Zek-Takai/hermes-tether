@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 CONSENT_SLACK_S = 90       # a first call may wait on the person at the device (consent_timeout_seconds)
 GUARD_HANDOFF_S = 600      # gate -> run on one thread, including the time a human takes on the card
 
-_guard = threading.local()   # set when Hermes's command gate checks a command while a device is the target
+_guard = threading.local()   # (command, time) noted when Hermes's command gate checks a command for a device
 
 
 _ENVS: "weakref.WeakValueDictionary[str, TetherEnvironment]" = weakref.WeakValueDictionary()
@@ -123,7 +123,7 @@ class TetherEnvironment:
     def execute(self, command: str, cwd: str = "", *, timeout: Optional[int] = None,
                 stdin_data: Optional[str] = None, **kwargs: Any) -> dict[str, Any]:
         target = self._target()
-        gated = _take_guard_handoff()
+        gated = _take_guard_handoff(command)
         if target == "local":
             if gated:
                 # Hermes's gate checked this command for a device, and the connection closed before it ran:
@@ -171,25 +171,37 @@ class TetherEnvironment:
             self._local = None
 
 
-def _from_command_gate() -> bool:
-    """True when Hermes's dangerous-command gate is the reader (not the execute_code gate, which approves a
-    script as a whole: its commands are still judged in full by the device)."""
+def _gate_command() -> Optional[str]:
+    """The command Hermes's dangerous-command gate is checking, when that gate is the reader (not the
+    execute_code gate, which approves a script as a whole: its commands are still judged in full by the
+    device). None otherwise."""
     import sys
     f = sys._getframe(1)
     for _ in range(8):
         if f is None:
-            return False
+            return None
         if f.f_code.co_name in ("check_all_command_guards", "check_dangerous_command"):
-            return True
+            command = f.f_locals.get("command")
+            return command if isinstance(command, str) else None
         f = f.f_back
-    return False
+    return None
 
 
-def _take_guard_handoff() -> bool:
-    """True once if Hermes's command gate checked a command for a device on this thread (D25)."""
-    at = getattr(_guard, "at", None)
-    _guard.at = None
-    return at is not None and time.monotonic() - at < GUARD_HANDOFF_S
+def _take_guard_handoff(command: str) -> bool:
+    """True once if Hermes's command gate checked exactly this command for a device on this thread (D25).
+    The note is made when the gate starts, before it decides; a different command (one the gate never saw,
+    e.g. from an execute_code script) never inherits it, and it is dropped when the tool call ends."""
+    note = getattr(_guard, "note", None)
+    _guard.note = None
+    if note is None:
+        return False
+    checked, at = note
+    return checked == command and time.monotonic() - at < GUARD_HANDOFF_S
+
+
+def clear_guard_handoff(**_: Any) -> None:
+    """post_tool_call hook: whatever the gate decided, its note ends with the tool call that made it."""
+    _guard.note = None
 
 
 def _ask_human(device: str, command: str, meta: dict[str, Any]) -> Optional[str]:
@@ -225,8 +237,10 @@ def make_provider():
             gate, on the thread that then runs the command; while a device is the target, note that the
             command went through the gate so the device does not ask the human a second time."""
             rt = get_runtime(create=False)
-            if rt is not None and rt.host is not None and rt.route() != "local" and _from_command_gate():
-                _guard.at = time.monotonic()
+            if rt is not None and rt.host is not None and rt.route() != "local":
+                command = _gate_command()
+                if command is not None:
+                    _guard.note = (command, time.monotonic())
             return False
 
         @property

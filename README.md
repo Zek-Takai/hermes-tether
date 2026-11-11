@@ -274,8 +274,10 @@ passphrase in Hermes's secret store.
 
 - Desktop machines only; headless servers are better served by SSH.
 - **Devices: macOS and Windows.** On Linux the device refuses remote use until its consent prompt is
-  added (only the prompt is missing; the rest is portable). The host and the Tether panel run anywhere
-  Hermes runs.
+  added (only the prompt is missing; the rest is portable).
+- **Host: macOS and Linux (POSIX) only.** The host's processes share one link through a file lock and a
+  Unix socket, so a Windows machine can be a device but not a host; there the host role logs a warning and
+  does not start. The Tether panel runs on all three.
 - If the host's approval mode is Off or YOLO, Hermes answers its own approval card itself; the device's
   floors still apply.
 - `execute_code` scripts reach the device as one command; each command they run is still judged by the

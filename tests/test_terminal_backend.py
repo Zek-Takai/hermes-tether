@@ -157,10 +157,10 @@ class TerminalBackendTests(unittest.TestCase):
         self.rt.turn_open["default"] = True
 
     @staticmethod
-    def _hermes_command_gate_reads(provider):
-        def check_all_command_guards():          # named like Hermes's gate: the provider looks for its reader
+    def _hermes_command_gate_reads(provider, command="echo FLAGGED"):
+        def check_all_command_guards(command, env_type="tether"):   # named like Hermes's gate (provider reads it)
             return provider.skip_container_guards
-        return check_all_command_guards()
+        return check_all_command_guards(command)
 
     def test_hermes_gates_are_never_skipped(self):
         from tether.provider import make_provider, _take_guard_handoff
@@ -170,9 +170,9 @@ class TerminalBackendTests(unittest.TestCase):
 
         def check_execute_code_guard():
             return p.skip_container_guards
-        _take_guard_handoff()
+        _take_guard_handoff("echo FLAGGED")
         self.assertFalse(check_execute_code_guard())
-        self.assertFalse(_take_guard_handoff())          # the code gate does not stand in for the command gate
+        self.assertFalse(_take_guard_handoff("echo FLAGGED"))   # the code gate does not stand in for the command gate
         self.rt.targets["default"] = "local"
         self.assertFalse(p.skip_container_guards)
 
@@ -187,13 +187,48 @@ class TerminalBackendTests(unittest.TestCase):
             r = self.env().execute("echo FLAGGED")
         self.assertEqual((r["output"].strip(), r["returncode"]), ("FLAGGED", 0))
 
+    def test_gate_note_covers_only_the_command_it_checked(self):
+        """The note is made when the gate starts reading, before it decides: a gate that then denies or aborts
+        must not let a different command (e.g. one from an execute_code script) through as already approved."""
+        from tether.provider import make_provider
+        p = make_provider()
+        self._on_device()
+        asked = []
+
+        def gate(command, env_type, **kw):
+            asked.append(command)
+            return {"approved": False, "message": "BLOCKED: denied"}
+        a, b, c, d = self._flagging()
+        with a, b, c, d, mock.patch("tools.approval.check_dangerous_command", gate):
+            self._hermes_command_gate_reads(p, "echo FLAGGED checked")     # the gate saw (and denied) this one
+            r = self.env().execute("echo FLAGGED other")                    # a different command arrives
+        self.assertEqual((r["output"], r["returncode"]), ("BLOCKED: denied", 1))
+        self.assertEqual(asked, ["echo FLAGGED other"])                    # judged in full, the human asked
+
+    def test_gate_note_ends_with_the_tool_call(self):
+        from tether.provider import make_provider, clear_guard_handoff
+        p = make_provider()
+        self._on_device()
+        asked = []
+
+        def gate(command, env_type, **kw):
+            asked.append(command)
+            return {"approved": False, "message": "BLOCKED: denied"}
+        a, b, c, d = self._flagging()
+        with a, b, c, d, mock.patch("tools.approval.check_dangerous_command", gate):
+            self._hermes_command_gate_reads(p)                             # gate read, then denied: never ran
+            clear_guard_handoff(tool_name="terminal", args={}, result="")  # post_tool_call
+            r = self.env().execute("echo FLAGGED")                         # same text, later, un-checked
+        self.assertEqual(r["returncode"], 1)
+        self.assertEqual(asked, ["echo FLAGGED"])
+
     def test_device_floors_hold_even_after_the_hermes_gate(self):
         from tether.provider import make_provider
         p = make_provider()
         self._on_device()
         fake = lambda c: (c == "echo HARDLINE-TEST", "test pattern")  # noqa: E731
         with mock.patch("tools.approval.detect_hardline_command", fake):
-            self._hermes_command_gate_reads(p)
+            self._hermes_command_gate_reads(p, "echo HARDLINE-TEST")
             r = self.env().execute("echo HARDLINE-TEST")
         self.assertEqual(r["returncode"], 1)
         self.assertNotIn("HARDLINE-TEST\n", r["output"])
@@ -235,9 +270,9 @@ class TerminalBackendTests(unittest.TestCase):
         from tether.provider import make_provider
         p = make_provider()
         self._on_device()
-        self._hermes_command_gate_reads(p)               # gated while the mac was the target
-        self.rt.targets["default"] = "local"            # ...then the connection closed before it ran
         marker = Path(tempfile.mkdtemp(prefix="hp-d25-")) / "ran"
+        self._hermes_command_gate_reads(p, f"touch {marker}")   # gated while the mac was the target
+        self.rt.targets["default"] = "local"            # ...then the connection closed before it ran
         r = self.env().execute(f"touch {marker}")
         self.assertEqual(r["returncode"], 1)
         self.assertIn("did not run anywhere", r["output"])

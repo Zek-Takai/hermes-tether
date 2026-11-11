@@ -60,7 +60,8 @@ class RegisterTests(unittest.TestCase):
     def kinds(self, ctx):
         return sorted(c[0] for c in ctx.calls)
 
-    SURFACES = ["register_cli_command", "register_hook", "register_hook", "register_hook", "register_middleware",
+    SURFACES = ["register_cli_command", "register_hook", "register_hook", "register_hook", "register_hook",
+                "register_middleware",
                 "register_terminal_environment_provider", "register_tool"]
 
     def test_off_registers_inert_surfaces_only(self):
@@ -68,7 +69,7 @@ class RegisterTests(unittest.TestCase):
         self.plugin.register(ctx)
         self.assertEqual(self.kinds(ctx), self.SURFACES)          # declared == registered (catalog validator)
         hooks = sorted(c[1][0] for c in ctx.calls if c[0] == "register_hook")
-        self.assertEqual(hooks, ["post_llm_call", "pre_llm_call", "transform_tool_result"])
+        self.assertEqual(hooks, ["post_llm_call", "post_tool_call", "pre_llm_call", "transform_tool_result"])
         mw = next(c for c in ctx.calls if c[0] == "register_middleware")
         self.assertEqual(mw[1][0], "tool_execution")
 

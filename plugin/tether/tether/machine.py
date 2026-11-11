@@ -7,6 +7,7 @@ terminal commands with bash on every OS; on Windows that bash is Git Bash (MSYS)
 from __future__ import annotations
 
 import platform
+import re
 from typing import Any
 
 
@@ -39,13 +40,19 @@ _OS = {
 _OS_NAME = {"Darwin": "macOS"}
 
 
+_VERSION_RE = re.compile(r"[A-Za-z0-9 ._()-]{1,40}")
+
+
 def describe(facts: dict[str, Any]) -> str:
     """One short paragraph about the machine for the agent; empty when the device sent nothing usable."""
     system = str(facts.get("os") or "")
-    if not system:
+    if not _VERSION_RE.fullmatch(system):
         return ""
     shell = str(facts.get("shell") or ("git-bash" if system == "Windows" else "bash"))   # older devices
-    name = " ".join(x for x in (_OS_NAME.get(system, system), str(facts.get("os_version") or "")) if x)
+    version = str(facts.get("os_version") or "")
+    if not _VERSION_RE.fullmatch(version):
+        version = ""                       # device-announced: only a plain version string reaches the model
+    name = " ".join(x for x in (_OS_NAME.get(system, system), version) if x)
     parts = [f"It runs {name}.", _SHELL.get(shell, "")]
     if shell != "git-bash":
         parts.append(_OS.get(system, ""))

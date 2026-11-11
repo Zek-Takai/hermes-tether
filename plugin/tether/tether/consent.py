@@ -29,6 +29,18 @@ class Grant:
     last_used: float
 
 
+def _minimal_env(keys: tuple[str, ...], extra: Optional[dict[str, str]] = None) -> dict[str, str]:
+    """Only what the prompt process needs: never Hermes's own environment (provider keys, tokens)."""
+    import os
+    env = {k: os.environ[k] for k in keys if os.environ.get(k)}
+    env.update(extra or {})
+    return env
+
+
+MAC_ENV_KEYS = ("PATH", "HOME", "LANG")
+WINDOWS_ENV_KEYS = ("PATH", "SystemRoot", "TEMP", "TMP", "USERPROFILE", "LANG", "LC_ALL")
+
+
 def _applescript_quote(s: str) -> str:
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
@@ -44,7 +56,8 @@ async def macos_prompt(text: str, timeout_s: float) -> bool:
         "  return button returned of r\n"
         "on error number -128\n  return \"Deny\"\nend try")
     proc = await asyncio.create_subprocess_exec("/usr/bin/osascript", "-", stdin=subprocess.PIPE,
-                                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                                env=_minimal_env(MAC_ENV_KEYS))
     try:
         out, _ = await asyncio.wait_for(proc.communicate(script.encode()), timeout_s + 15)
     except asyncio.TimeoutError:
@@ -73,9 +86,9 @@ async def windows_prompt(text: str, timeout_s: float) -> bool:
     within the timeout = deny. The text travels in an environment variable, never inside the script, so nothing
     in it can run. Needs Hermes running in the signed-in user's session (a background service has no screen to
     show it on, and then every session is denied)."""
-    import os
-    env = {**os.environ, "TETHER_PROMPT_TEXT": text + "\n\nAllow (Yes) or deny (No)?",
-           "TETHER_PROMPT_TIMEOUT": str(int(timeout_s)), "TETHER_PROMPT_FLAGS": str(WINDOWS_POPUP_FLAGS)}
+    env = _minimal_env(WINDOWS_ENV_KEYS, {
+        "TETHER_PROMPT_TEXT": text + "\n\nAllow (Yes) or deny (No)?",
+        "TETHER_PROMPT_TIMEOUT": str(int(timeout_s)), "TETHER_PROMPT_FLAGS": str(WINDOWS_POPUP_FLAGS)})
     try:
         proc = await asyncio.create_subprocess_exec(
             _powershell(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", WINDOWS_SCRIPT,

@@ -60,6 +60,24 @@ class WindowsPromptTests(unittest.TestCase):
         self.assertTrue(env.endswith(f"|45|{consent.WINDOWS_POPUP_FLAGS}"))
         self.assertIn("-NonInteractive", args)
 
+    def test_prompts_never_get_hermes_secrets(self):
+        seen = []
+
+        async def capture(*args, **kwargs):
+            seen.append(kwargs.get("env"))
+            raise OSError("not started")
+        with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-secret", "PATH": "/usr/bin", "HOME": "/h"}), \
+                mock.patch("asyncio.create_subprocess_exec", capture):
+            self.assertFalse(asyncio.run(consent.windows_prompt("x", 5)))
+            with self.assertRaises(OSError):
+                asyncio.run(consent.macos_prompt("x", 5))
+        win, mac = seen
+        self.assertNotIn("OPENROUTER_API_KEY", win)
+        self.assertEqual(win["PATH"], "/usr/bin")
+        self.assertEqual(win["TETHER_PROMPT_TIMEOUT"], "5")
+        self.assertEqual(mac, {"PATH": "/usr/bin", "HOME": "/h"} | ({"LANG": os.environ["LANG"]}
+                                                                    if os.environ.get("LANG") else {}))
+
     def test_missing_powershell_denies(self):
         with mock.patch.object(consent, "_powershell", lambda: "/nonexistent/powershell.exe"):
             self.assertFalse(asyncio.run(consent.windows_prompt("x", 5)))

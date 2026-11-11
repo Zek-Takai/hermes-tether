@@ -235,6 +235,18 @@ class PanelApiTests(unittest.TestCase):
         kinds = [e["kind"] for e in store.read_events(self.d)]
         self.assertEqual(kinds[:2], ["settings_changed", "device_renamed"])
 
+    def test_device_status_never_loads_the_host_link(self):
+        """The host link is POSIX-only (fcntl, a Unix socket): a device's panel, e.g. on Windows, must not load it."""
+        sys.modules.pop("tether_panel_core.hostlink", None)
+        with self.roles(["device"]):
+            asyncio.run(self.api.status())
+        self.assertNotIn("tether_panel_core.hostlink", sys.modules)
+        with self.roles(["host"]), mock.patch.object(sys, "platform", "win32"):
+            body = asyncio.run(self.api.status())
+        self.assertEqual(body["host"]["devices"], [])
+        self.assertIn("macOS or Linux", body["host"]["note"])
+        self.assertNotIn("tether_panel_core.hostlink", sys.modules)
+
     def test_settings_and_pause_only_on_a_device(self):
         from fastapi import HTTPException
         with self.roles(["host"]):

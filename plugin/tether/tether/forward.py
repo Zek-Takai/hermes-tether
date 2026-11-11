@@ -50,7 +50,11 @@ def _host_owned(path: Any) -> bool:
     """Paths inside this host's own Hermes home (her skills, memories, sessions) stay on the host."""
     if not isinstance(path, str) or not path.startswith(("/", "~")):
         return False
-    home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+    try:
+        from hermes_constants import get_hermes_home
+        home = str(get_hermes_home())       # the active profile's home
+    except Exception:  # noqa: BLE001 - tests / outside Hermes
+        home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
     try:
         root = os.path.realpath(home)
         full = os.path.realpath(os.path.expanduser(path)) if path.startswith("~") else os.path.realpath(path)
@@ -100,6 +104,15 @@ def tool_execution(**kwargs: Any) -> Any:
     return json.loads(text) if meta.get("json_dict") else text
 
 
+_HOME_RE = re.compile(r"[A-Za-z0-9 ._~:/\\-]{1,200}")
+
+
+def _safe_home(value: Any) -> str:
+    """The device announces its home folder; only a plain path goes into the model's note (no newlines, no
+    instructions), else nothing."""
+    return value if isinstance(value, str) and _HOME_RE.fullmatch(value) else ""
+
+
 def _device_facts(target: str) -> dict[str, Any]:
     cached = _facts.get(target)
     if cached and time.monotonic() - cached[0] < 120:
@@ -132,7 +145,8 @@ def turn_context(session_id: str = "", user_message: Any = "", **kwargs: Any) ->
     if target is None:
         note = rt.closed_note.pop(session_id, note)          # route() may have just timed it out
         return f"[tether] {note}" if note else None
-    where = f" (home {f['home']})" if f.get("home") else ""
+    home = _safe_home(f.get("home"))
+    where = f" (home {home})" if home else ""
     about = describe(f)
     return (f"[tether] You are working ON the paired machine '{target}'{where}, as if it were your own. "
             f"{about + ' ' if about else ''}Terminal, read_file, write_file, patch, search_files and computer_use act on "

@@ -27,7 +27,13 @@ def _core():
         mod = importlib.util.module_from_spec(spec)
         sys.modules[_NAME] = mod
         spec.loader.exec_module(mod)
-    return importlib.import_module(f"{_NAME}.store"), importlib.import_module(f"{_NAME}.hostlink")
+    return importlib.import_module(f"{_NAME}.store")
+
+
+def _hostlink():
+    """Only for the host role (POSIX only: it uses fcntl and a Unix socket); never imported on a device."""
+    _core()
+    return importlib.import_module(f"{_NAME}.hostlink")
 
 
 router = APIRouter()
@@ -79,12 +85,15 @@ async def _devices(store, hostlink) -> tuple[list[dict[str, Any]], str]:
 
 @router.get("/status")
 async def status(limit: int = 100):
-    store, hostlink = _core()
+    store = _core()
     s = _settings()
     d = store.data_dir()
     body: dict[str, Any] = {"roles": s["roles"], "name": s["name"], "events": store.read_events(d, min(limit, 300))}
     if "host" in s["roles"]:
-        devices, note = await _devices(store, hostlink)
+        if sys.platform == "win32":
+            devices, note = [], "the host role needs macOS or Linux; this Windows machine can only be a device"
+        else:
+            devices, note = await _devices(store, _hostlink())
         body["host"] = {"devices": devices, "note": note}
     if "device" in s["roles"]:
         pin = store.HostPin(d).get() or {}
@@ -103,7 +112,7 @@ async def status(limit: int = 100):
 async def update_device(name: str, body: dict):
     """Host: rename a paired device (its label is the word that opens it) and set this host's idle limit for it.
     A renamed device reconnects under its new label within seconds."""
-    store, _ = _core()
+    store = _core()
     if "host" not in _settings()["roles"]:
         raise HTTPException(status_code=403, detail="device labels and host idle limits are set on the host")
     body = body or {}
@@ -123,7 +132,7 @@ async def update_device(name: str, body: dict):
 
 @router.put("/settings")
 async def save_settings(body: dict):
-    store, _ = _core()
+    store = _core()
     if "device" not in _settings()["roles"]:
         raise HTTPException(status_code=403, detail="settings belong to each device; open this panel on that device")
     try:
@@ -136,7 +145,7 @@ async def save_settings(body: dict):
 
 @router.post("/pause")
 async def pause(body: dict):
-    store, _ = _core()
+    store = _core()
     if "device" not in _settings()["roles"]:
         raise HTTPException(status_code=403, detail="pause belongs to each device; open this panel on that device")
     flag = store.data_dir() / "paused"

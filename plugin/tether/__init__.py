@@ -11,6 +11,7 @@ passes calls through, the per-turn hook adds nothing.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 
 logger = logging.getLogger(__name__)
@@ -30,7 +31,7 @@ def _in_gateway() -> bool:
 def register(ctx) -> None:
     from .tether import cli, forward, tools
     from .tether.config import read_settings
-    from .tether.provider import make_provider
+    from .tether.provider import clear_guard_handoff, make_provider
 
     def get(key, default=None):
         try:
@@ -47,6 +48,7 @@ def register(ctx) -> None:
     ctx.register_hook("pre_llm_call", forward.turn_context)
     ctx.register_hook("post_llm_call", forward.turn_closed)
     ctx.register_hook("transform_tool_result", forward.skill_files)
+    ctx.register_hook("post_tool_call", clear_guard_handoff)
     s = read_settings(get)
     if not s.roles:
         logger.debug("tether: role is off; surfaces registered but inert")
@@ -58,7 +60,10 @@ def _start_services(s, ctx) -> None:
     from .tether.runtime import get_runtime, set_host_factory
     from .tether.store import HostPin, data_dir
 
-    if "host" in s.roles:
+    if "host" in s.roles and os.name == "nt":
+        logger.warning("tether: the host role needs macOS or Linux (Windows runs the device role only); "
+                       "host not started")
+    elif "host" in s.roles:
         from .tether.config import identity
         from .tether.host import HostService
         from .tether.hostlink import HostLink
