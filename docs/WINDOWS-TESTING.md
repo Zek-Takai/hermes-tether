@@ -34,4 +34,4 @@ files a running program holds open. Run them again after changes to the device s
 | 6 | Open an app from the workspace, then `untether` | Connection closes; the workspace is emptied, or within a minute if the app still held a file |
 | 7 | Tether panel on the host | `studio-pc` online beside `mac`: two machines, one agent |
 
-Validated on Windows 11 (Hermes 0.23.0): checks 1, 2, 3, 4, 6 and 7 passed on a real PC.
+Validated on Windows 11 (Hermes 0.23.0): all seven checks passed on a real PC.
