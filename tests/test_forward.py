@@ -109,6 +109,7 @@ class MiddlewareTests(unittest.TestCase):
         self.rt.targets["default"] = "mac"
         self.rt.turn_open["default"] = True
         os.environ.pop("HERMES_SESSION_ID", None)
+        os.environ.pop("HERMES_SESSION_KEY", None)
         forward._facts.clear()
 
     def tearDown(self):

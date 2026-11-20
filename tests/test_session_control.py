@@ -103,6 +103,7 @@ class UserWordsTests(unittest.TestCase):
                   self.rt.idle_limit_s, self.rt.closed_note, self.rt.skill_copies):
             d.clear()
         os.environ.pop("HERMES_SESSION_ID", None)
+        os.environ.pop("HERMES_SESSION_KEY", None)
         forward._facts.clear()
 
     def tearDown(self):
