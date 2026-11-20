@@ -43,6 +43,7 @@ class TerminalBackendTests(unittest.TestCase):
         cls.rt.run(up(), 30)
         cls.rt.host = cls.rig.host
         os.environ.pop("HERMES_SESSION_ID", None)
+        os.environ.pop("HERMES_SESSION_KEY", None)
 
     @classmethod
     def tearDownClass(cls):

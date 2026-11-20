@@ -75,6 +75,7 @@ class ScreenTests(unittest.TestCase):
         cls.rt.targets["default"] = "mac"
         cls.rt.turn_open["default"] = True
         os.environ.pop("HERMES_SESSION_ID", None)
+        os.environ.pop("HERMES_SESSION_KEY", None)
         cls.backend = load_screen_plugin().TetherScreenProvider().create_backend(permission_mode="standard")
 
     @classmethod
