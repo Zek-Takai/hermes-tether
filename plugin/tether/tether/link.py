@@ -7,6 +7,7 @@ Either side can call the other (the device sends ``announce`` events; the host c
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import itertools
 import logging
 import time
@@ -19,6 +20,15 @@ logger = logging.getLogger(__name__)
 Handler = Callable[[dict[str, Any], bytes], Awaitable[tuple[dict[str, Any], bytes]]]
 PING_EVERY_S = 20.0
 DEAD_AFTER_S = 60.0
+
+# When the caller of the call being handled stops waiting (time.monotonic()), from its frame's "deadline". Set in
+# each handler's own task, so it is that call's alone.
+_call_expires: contextvars.ContextVar[Optional[float]] = contextvars.ContextVar("tether_call_expires", default=None)
+
+
+def call_expires() -> Optional[float]:
+    """For a handler: the time.monotonic() at which the other side gives up on this call, or None if it sent none."""
+    return _call_expires.get()
 
 
 class RemoteError(Exception):
@@ -94,7 +104,8 @@ class Peer:
                         self._dispatch(self._partial.pop(header["id"]), data)
                     continue
                 if header.get("chunked"):
-                    self._partial[header["id"]] = header
+                    # a call's deadline counts from its first frame, not from when its last chunk arrived
+                    self._partial[header["id"]] = {**header, "_arrived": self.last_seen}
                     continue
                 self._dispatch(header, body)
         except (ConnectionError, asyncio.IncompleteReadError, frames.FrameError) as e:
@@ -125,6 +136,9 @@ class Peer:
 
     async def _run_handler(self, header: dict[str, Any], body: bytes) -> None:
         cid, kind = header["id"], header.get("kind")
+        deadline = header.get("deadline")
+        if isinstance(deadline, (int, float)) and not isinstance(deadline, bool) and deadline > 0:
+            _call_expires.set(float(header.get("_arrived") or time.monotonic()) + float(deadline))
         handler = self.handlers.get(kind)
         try:
             if handler is None:

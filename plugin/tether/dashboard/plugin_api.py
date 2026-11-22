@@ -48,8 +48,9 @@ def _settings() -> dict[str, Any]:
     entry = (((cfg.get("plugins") or {}).get("entries") or {}).get("tether") or {}).get("settings") or {}
     roles = sorted({r.strip() for r in str(entry.get("role") or "off").lower().split(",")} & {"host", "device"})
     return {"roles": roles, "name": str(entry.get("name") or ""),
-            "grant_idle_minutes": float(entry.get("grant_idle_minutes") or 15),
-            "consent_timeout_seconds": float(entry.get("consent_timeout_seconds") or 15)}
+            "grant_idle_minutes": float(entry.get("grant_idle_minutes") or _core().DEFAULT_GRANT_IDLE_MINUTES),
+            "consent_timeout_seconds": float(entry.get("consent_timeout_seconds") or 60),
+            "allow_unlocked_commands": _core().flag(entry.get("allow_unlocked_commands"), _core().default_unlocked())}
 
 
 async def _devices(store, hostlink) -> tuple[list[dict[str, Any]], str]:
@@ -101,11 +102,32 @@ async def status(limit: int = 100):
         body["device"] = {
             "paired_host": pin.get("name") or pin.get("label") or ("paired" if pin else None),
             "paused": (d / "paused").exists(),
+            # on | off | damaged | unknown: the record file's outside and what the running Hermes published, never
+            # the key.
+            # Set up only with the CLI at the device (D67); the panel offers no button for it.
+            "authenticator": _authenticator_state(d),
             "grant_idle_minutes": panel.get("grant_idle_minutes", s["grant_idle_minutes"]),
             "consent_timeout_seconds": panel.get("consent_timeout_seconds", s["consent_timeout_seconds"]),
+            # D73: on means a remote session's commands run without the session lock. The default is on for
+            # Windows (no lock there: off means they do not run) and off for macOS (the lock holds them).
+            "allow_unlocked_commands": panel.get("allow_unlocked_commands", s["allow_unlocked_commands"]),
+            "system": "windows" if sys.platform == "win32" else ("macos" if sys.platform == "darwin" else "other"),
             "limits": {k: {"min": lo, "max": hi} for k, (lo, hi) in store.SETTINGS_LIMITS.items()},
         }
     return body
+
+
+def _authenticator_state(d) -> str:
+    seeds = importlib.import_module(f"{_NAME}.seedstore")
+    pointer = seeds.pointer_state(d)
+    if pointer == seeds.NONE:
+        return "off"
+    if pointer == seeds.MISSING:
+        return "damaged"
+    status = (seeds.read_published(d) or {}).get("status")
+    if status == seeds.READY:
+        return "on"
+    return "damaged" if status == seeds.MISSING else "unknown"
 
 
 @router.put("/devices/{name}")
@@ -137,9 +159,14 @@ async def save_settings(body: dict):
         raise HTTPException(status_code=403, detail="settings belong to each device; open this panel on that device")
     try:
         saved = store.write_panel_settings(store.data_dir(), {k: v for k, v in (body or {}).items()
-                                                              if k in store.SETTINGS_LIMITS})
+                                                              if k in store.SETTINGS_LIMITS or k in store.SETTINGS_FLAGS})
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+    if "allow_unlocked_commands" in saved and "allow_unlocked_commands" in (body or {}):
+        store.log_event(store.data_dir(), "settings_changed",
+                        reason="unlocked commands " + ("on" if saved["allow_unlocked_commands"] else "off")
+                               + " (from the Tether panel; applies once no remote session is connected)")
+        return {"saved": saved, "note": "applies once no remote session is connected"}
     return {"saved": saved, "note": "applies within a few seconds"}
 
 

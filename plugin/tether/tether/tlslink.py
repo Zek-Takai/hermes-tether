@@ -9,10 +9,12 @@
 from __future__ import annotations
 
 import _ssl
+import os
 import ssl
+import tempfile
 from typing import Iterable, Optional
 
-from .identity import Identity, fingerprint
+from .identity import CERT_FILE, Identity, fingerprint
 
 ALLOWED_SUITES = frozenset({"TLS_AES_256_GCM_SHA384", "TLS_CHACHA20_POLY1305_SHA256"})
 
@@ -45,26 +47,31 @@ def _base(purpose: ssl.Purpose, ident: Identity) -> ssl.SSLContext:
     _set(ctx, "minimum_version", ssl.TLSVersion.TLSv1_3)
     _set(ctx, "maximum_version", ssl.TLSVersion.TLSv1_3)
     _set(ctx, "check_hostname", False)          # identity is the pin, not a hostname
-    ctx.load_cert_chain(certfile=_tmp_cert(ident), keyfile=str(ident.key_path),
-                        password=ident.password_callback())
+    cert, temp = _cert_path(ident)
+    try:
+        ctx.load_cert_chain(certfile=cert, keyfile=str(ident.key_path), password=ident.password_callback())
+    finally:
+        if temp:                       # a copy made only for this call: never left in the temp folder
+            try:
+                os.unlink(cert)
+            except OSError:
+                pass
     return ctx
 
 
-_cert_files: dict[str, str] = {}
-
-
-def _tmp_cert(ident: Identity) -> str:
-    """``load_cert_chain`` wants a path; the certificate is public, so a private temp file is fine."""
-    import os
-    import tempfile
-    path = _cert_files.get(ident.fp)
-    if path and os.path.exists(path):
-        return path
+def _cert_path(ident: Identity) -> tuple[str, bool]:
+    """``load_cert_chain`` wants a path. The certificate already sits next to the key (identity.CERT_FILE): use it
+    when it still matches. Otherwise write a private temp copy; the caller deletes it right after loading."""
+    stored = ident.key_path.parent / CERT_FILE
+    try:
+        if stored.read_bytes() == ident.cert_pem:
+            return str(stored), False
+    except OSError:
+        pass
     fd, path = tempfile.mkstemp(prefix="tether-", suffix=".crt")
     with os.fdopen(fd, "wb") as fh:
         fh.write(ident.cert_pem)
-    _cert_files[ident.fp] = path
-    return path
+    return path, True
 
 
 def server_context(ident: Identity, pinned_peer_certs: Iterable[bytes], *, require_client_cert: bool) -> ssl.SSLContext:

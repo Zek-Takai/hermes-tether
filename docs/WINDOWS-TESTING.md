@@ -5,7 +5,7 @@ files a running program holds open. Run them again after changes to the device s
 
 ## Set up the PC
 
-1. Install Hermes 0.23.0 or newer and run it **in your signed-in session** (Hermes Desktop or `hermes`
+1. Install Hermes 0.23.3 and run it **in your signed-in session** (Hermes Desktop or `hermes`
    in a terminal). A background Windows service has no screen to show the consent box on, so every session
    would be denied.
 2. Copy `plugin/tether` from this repository into `%LOCALAPPDATA%\hermes\plugins\tether` (Hermes's home on Windows), then in
@@ -20,7 +20,8 @@ files a running program holds open. Run them again after changes to the device s
            name: studio-pc
    ```
 3. `hermes gateway restart`.
-4. Pair: on the host `hermes tether pair studio-pc`; on the PC `hermes tether join "<link>"`.
+4. Pair: on the host `hermes tether pair studio-pc`; on the PC run `hermes tether join` and paste the link at its
+   prompt (a link on the command line is visible to other programs and kept in shell history).
 
 ## Checks
 

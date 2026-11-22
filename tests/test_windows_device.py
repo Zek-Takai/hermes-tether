@@ -1,4 +1,4 @@
-"""Windows device support, simulated on any OS: the consent prompt (Windows' own timed message box) and a
+"""Windows device support, simulated on any OS: the approval code box (a masked PowerShell form; D63) and a
 workspace wipe that survives files a running program still holds open."""
 from __future__ import annotations
 
@@ -14,15 +14,16 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugin" / "tether"))
 
 from tether import consent, workspace  # noqa: E402
+from test_link_loopback import temp_dir  # noqa: E402
 
 
-def fake_powershell(answer: str) -> str:
-    """A stand-in for powershell.exe: records its arguments and environment, prints the Popup's answer."""
-    d = Path(tempfile.mkdtemp(prefix="hp-ps-"))
+def fake_powershell(test, answer: str) -> str:
+    """A stand-in for powershell.exe: records its arguments and environment, prints the box's answer."""
+    d = temp_dir(test, "hp-ps-")
     script = d / "powershell"
     script.write_text("#!/bin/sh\n"
                       f'printf "%s\\n" "$@" > "{d}/args"\n'
-                      f'printf "%s" "$TETHER_PROMPT_TEXT|$TETHER_PROMPT_TIMEOUT|$TETHER_PROMPT_FLAGS" > "{d}/env"\n'
+                      f'printf "%s" "$TETHER_BOX_TEXT|$TETHER_BOX_TIMEOUT|$TETHER_BOX_TITLE" > "{d}/env"\n'
                       f'printf "%s" "{answer}"\n')
     script.chmod(0o755)
     return str(script)
@@ -30,35 +31,35 @@ def fake_powershell(answer: str) -> str:
 
 class PromptChoiceTests(unittest.TestCase):
     def test_prompt_per_os(self):
-        for system, expected in (("Darwin", consent.macos_prompt), ("Windows", consent.windows_prompt),
-                                 ("Linux", consent.unsupported_prompt)):
+        for system, expected in (("Darwin", consent.macos_code_box), ("Windows", consent.windows_code_box),
+                                 ("Linux", consent.unsupported_box)):
             with mock.patch.object(consent.platform, "system", lambda s=system: s):
                 self.assertIs(consent.default_prompt(), expected, system)
 
 
 @unittest.skipIf(sys.platform == "win32", "uses a POSIX shell stand-in for powershell.exe")
 class WindowsPromptTests(unittest.TestCase):
-    def ask(self, answer: str, text: str = "Hermes on nas wants to use this machine"):
-        exe = fake_powershell(answer)
+    def ask(self, answer: str, text: str = "Hermes on nas wants to use this computer"):
+        exe = fake_powershell(self, answer)
         with mock.patch.object(consent, "_powershell", lambda: exe):
-            allowed = asyncio.run(consent.windows_prompt(text, 45))
+            typed = asyncio.run(consent.windows_code_box(text, 45))
         d = Path(exe).parent
-        return allowed, (d / "args").read_text(), (d / "env").read_text()
+        return typed, (d / "args").read_text(), (d / "env").read_text()
 
-    def test_yes_allows_no_and_timeout_deny(self):
-        self.assertTrue(self.ask("6")[0])
-        self.assertFalse(self.ask("7")[0])
-        self.assertFalse(self.ask("-1")[0])           # no answer within the timeout
-        self.assertFalse(self.ask("")[0])             # anything else
+    def test_only_what_was_typed_comes_back_and_nothing_else_approves(self):
+        self.assertEqual(self.ask("CODE:12 34 56")[0], "12 34 56")    # handed to the check, never judged here
+        for answer in ("CANCEL", "TIMEOUT", "6", "", "Approve", "CODE:" + "1" * 65):
+            self.assertIsNone(self.ask(answer)[0], answer)          # the old Yes ("6") is no answer at all
 
     def test_text_never_enters_the_command(self):
         hostile = "x'); Remove-Item C:\\ -Recurse; ('"
-        allowed, args, env = self.ask("7", hostile)
-        self.assertFalse(allowed)
+        typed, args, env = self.ask("CANCEL", hostile)
+        self.assertIsNone(typed)
         self.assertNotIn("Remove-Item", args)          # the script is fixed; the text only travels in the env
         self.assertIn("Remove-Item", env)
-        self.assertTrue(env.endswith(f"|45|{consent.WINDOWS_POPUP_FLAGS}"))
+        self.assertTrue(env.endswith(f"|45|{consent.BOX_TITLE_WINDOWS}"))
         self.assertIn("-NonInteractive", args)
+        self.assertIn("UseSystemPasswordChar = $true", args)   # what is typed shows masked
 
     def test_prompts_never_get_hermes_secrets(self):
         seen = []
@@ -68,24 +69,23 @@ class WindowsPromptTests(unittest.TestCase):
             raise OSError("not started")
         with mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-secret", "PATH": "/usr/bin", "HOME": "/h"}), \
                 mock.patch("asyncio.create_subprocess_exec", capture):
-            self.assertFalse(asyncio.run(consent.windows_prompt("x", 5)))
-            with self.assertRaises(OSError):
-                asyncio.run(consent.macos_prompt("x", 5))
+            self.assertIsNone(asyncio.run(consent.windows_code_box("x", 5)))
+            self.assertIsNone(asyncio.run(consent.macos_code_box("x", 5)))
         win, mac = seen
         self.assertNotIn("OPENROUTER_API_KEY", win)
         self.assertEqual(win["PATH"], "/usr/bin")
-        self.assertEqual(win["TETHER_PROMPT_TIMEOUT"], "5")
+        self.assertEqual(win["TETHER_BOX_TIMEOUT"], "5")
         self.assertEqual(mac, {"PATH": "/usr/bin", "HOME": "/h"} | ({"LANG": os.environ["LANG"]}
                                                                     if os.environ.get("LANG") else {}))
 
     def test_missing_powershell_denies(self):
         with mock.patch.object(consent, "_powershell", lambda: "/nonexistent/powershell.exe"):
-            self.assertFalse(asyncio.run(consent.windows_prompt("x", 5)))
+            self.assertIsNone(asyncio.run(consent.windows_code_box("x", 5)))
 
 
 class HeldFileWipeTests(unittest.TestCase):
     def test_held_file_is_left_for_the_sweeper(self):
-        ws = workspace.Workspaces(Path(tempfile.mkdtemp(prefix="hp-wsw-")) / "sessions")
+        ws = workspace.Workspaces(temp_dir(self, "hp-wsw-") / "sessions")
         p = ws.ensure("s1")
         (p / "locked.txt").write_text("in use")
         (p / "free.txt").write_text("x")
@@ -110,7 +110,7 @@ class ReservedNameWipeTests(unittest.TestCase):
     Windows (WinError 1), which crashed the close and every sweep."""
 
     def test_chmod_failure_does_not_stop_the_wipe(self):
-        ws = workspace.Workspaces(Path(tempfile.mkdtemp(prefix="hp-wsn-")) / "sessions")
+        ws = workspace.Workspaces(temp_dir(self, "hp-wsn-") / "sessions")
         p = ws.ensure("s1")
         (p / "nul").write_text("")
         (p / "skills").mkdir()

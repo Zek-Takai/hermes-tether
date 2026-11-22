@@ -10,7 +10,9 @@ import json
 import struct
 from typing import Any, Iterator, Optional
 
-PROTOCOL = {"major": 1, "minor": 0}
+# 2.0: every call carries the session's grant token (D33). Host and devices must run the same major, so a
+# side that does not send or check tokens can never pair up with one that does.
+PROTOCOL = {"major": 2, "minor": 0}
 MAX_HEADER = 64 * 1024
 MAX_BODY = 256 * 1024            # one frame; bigger payloads are chunked
 MAX_CALL_BYTES = 64 * 1024 * 1024
@@ -95,10 +97,16 @@ class Reassembler:
         self._sizes.pop(cid, None)
 
 
+def _version_text(v: Any) -> str:
+    """A version the other side sent, shown only when it is a plain integer: anything else is device text."""
+    return str(v) if isinstance(v, int) and not isinstance(v, bool) else "?"
+
+
 def check_hello(header: dict[str, Any]) -> None:
     """Protocol versioning (D17): same major required."""
     peer = header.get("protocol") or {}
     if header.get("t") != "hello" or peer.get("major") != PROTOCOL["major"]:
         raise FrameError(
             f"protocol mismatch: this side speaks {PROTOCOL['major']}.{PROTOCOL['minor']}, the other side "
-            f"{peer.get('major')}.{peer.get('minor')}; update tether on both machines to the same version")
+            f"{_version_text(peer.get('major'))}.{_version_text(peer.get('minor'))}; "
+            "update tether on both machines to the same version")

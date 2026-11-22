@@ -1,9 +1,10 @@
 """tether: a remote Hermes agent with the local capabilities of paired desktop machines.
 
 Inert until ``plugins.entries.tether.settings.role`` is set (design D7/D18): installing it opens no port and
-dials nowhere. Every surface is registered in every role (so what the manifest declares is what registers) and
-does nothing until a role is set: the devices tool and the terminal backend are unavailable, the middleware
-passes calls through, the per-turn hook adds nothing.
+dials nowhere. Whatever the role, it first takes the key passphrase out of the process environment (D40).
+Every surface is registered in every role (so what the manifest declares is what registers) and does nothing
+until a role is set: the devices tool and the terminal backend are unavailable, the middleware passes calls
+through (after taking the passphrase out of the environment again), the per-turn hook adds nothing.
 - host: every Hermes process on the host reaches the link (one owner, the rest relay, hostlink.py); while a
   device is a session's target the session works ON that device (design D22, forward.py).
 - device: the gateway process dials the host and runs its calls through this machine's own Hermes.
@@ -39,6 +40,10 @@ def register(ctx) -> None:
         except Exception:  # noqa: BLE001 - inert on any doubt
             return default
 
+    forward.record_process_origin()     # before any shell of this process runs: was it started from an agent's shell?
+    # First, whatever the role and before any setting is parsed (a typo there must not leave the passphrase in
+    # this process's environment, F74): every Hermes process the plugin loads in.
+    _protect_passphrase(ctx)
     ctx.register_cli_command("tether", "Pair devices with this Hermes and check the link", cli.setup,
                              cli.main_for(get), description="tether: remote agent, local capabilities")
     ctx.register_tool("devices", "tether", tools.SCHEMA, tools.handler, check_fn=tools.check,
@@ -53,7 +58,56 @@ def register(ctx) -> None:
     if not s.roles:
         logger.debug("tether: role is off; surfaces registered but inert")
         return
+    _check_hermes_surfaces()
     _start_services(s, ctx)   # host: every process gets the link (owner or relay); device: gateway only
+
+
+# Private Hermes functions whose absence would silently switch a protection off (F81): (module, name, what is lost).
+_HERMES_SURFACES = (
+    ("tools.interrupt", "set_interrupt", "Stop will not end a command running for the host or on a device"),
+    ("tools.interrupt", "is_interrupted", "Stop will not end a command running for the host or on a device"),
+    ("agent.redact_vault_values", "register_vault_redaction_value",
+     "the key passphrase will not be masked in Hermes's own tool output"),
+    ("tools.skill_provenance", "is_background_review",
+     "a background review is recognised by its thread name only"),
+    ("agent.delegation_context", "is_delegated_child_process_context",
+     "a delegated child process is recognised by its platform and environment only"),
+)
+
+
+def _check_hermes_surfaces() -> list:
+    """At role start: log, once per lost protection, each private Hermes function tether relies on that this Hermes
+    lacks (an update renamed or moved it). Returns what is lost (tests)."""
+    import importlib
+    lost: list = []
+    for module, name, effect in _HERMES_SURFACES:
+        try:
+            ok = callable(getattr(importlib.import_module(module), name, None))
+        except Exception:  # noqa: BLE001
+            ok = False
+        if not ok and effect not in lost:
+            lost.append(effect)
+            logger.warning("tether: this Hermes lacks %s.%s, so %s", module, name, effect)
+    return lost
+
+
+def _protect_passphrase(ctx) -> None:
+    """Take the key passphrase out of this process's environment (identity.protect_passphrase). Every Hermes process
+    the plugin loads in runs this, whatever its role, not only the one that loads the key."""
+    try:
+        from .tether.identity import LEGACY_PASSPHRASE_SECRETS, PASSPHRASE_SECRET, HermesSecretStore, protect_passphrase
+        protect_passphrase(HermesSecretStore())
+    except Exception:  # noqa: BLE001 - logged inside protect_passphrase; the link itself still starts
+        logger.warning("tether: passphrase protection not applied in this process")
+        return
+    names = [PASSPHRASE_SECRET, *LEGACY_PASSPHRASE_SECRETS]
+    # Declared as session env so Hermes never bakes the names into a terminal's shell snapshot. The None value does
+    # NOT unset them in a child on Hermes 0.23.3: Hermes drops a session-env value for any name a terminal provider
+    # lists in strip_env_keys (provider.py), and those lists must stay for background children (DESIGN 5.1).
+    try:
+        ctx.register_session_env(names, lambda _session: {name: None for name in names})
+    except Exception:  # noqa: BLE001 - another plugin holds the names
+        logger.debug("tether: session env names not registered")
 
 
 def _start_services(s, ctx) -> None:
@@ -89,23 +143,47 @@ def _start_services(s, ctx) -> None:
         from .tether.device import DeviceService
         from .tether.device_exec import LocalExec, SessionControl, ToolRunner, capabilities
         from .tether.device_screen import ScreenExec
+        from .tether.lock import set_unlocked
+        from .tether.store import read_panel_settings
         from .tether.workspace import Workspaces
-        gate = ConsentGate(idle_minutes=s.grant_idle_minutes, timeout_s=s.consent_timeout_seconds)
+        from .tether.authcode import SETUP_COMMAND, CodeChecker
+        from .tether.seedstore import NONE, SeedStore
+        # D73: allow_unlocked_commands (the panel's choice wins over config.yaml; unset: on for Windows, off for
+        # macOS). Off on macOS: every session command runs inside the session lock. Off on Windows: none runs.
+        set_unlocked(read_panel_settings(data_dir()).get("allow_unlocked_commands", s.allow_unlocked_commands))
+        # D63, D66, D68: the approval box checks codes from the person's authenticator app against the seed, opened
+        # now from its sealed file in this data folder (sealed with Tether's key passphrase, the secret that unlocks
+        # identity.key.enc) and then held in memory; each code step is recorded as used in a state file sealed with
+        # a key derived from the seed, so it is never accepted twice. No authenticator: every session is refused
+        # before any box (no fallback). No prompt, keychain or administrator dialog of any kind (D66).
+        seeds = SeedStore(data_dir(), publish=True, secret=lambda: identity(s).passphrase)
+        gate = ConsentGate(idle_minutes=s.grant_idle_minutes, timeout_s=s.consent_timeout_seconds,
+                           codes=CodeChecker(seeds, data_dir(), narrow=True))
+        if seeds.status() == NONE:
+            logger.warning("tether: remote use of this device is off until its authenticator is set up: run `%s` in "
+                           "a terminal on this machine", SETUP_COMMAND)
         gate.events_dir = data_dir()
         rt.consent = gate
-        screen = ScreenExec(gate)
-        workspaces = Workspaces(data_dir() / "sessions")
-        removed = workspaces.wipe_all()               # anything left by a crash or a hard stop goes now
+        try:
+            workspaces = Workspaces(data_dir() / "sessions")
+        except Exception as e:  # noqa: BLE001 - not Tether's own folder (a link in its place): no session work here
+            logger.error("tether: the device role did not start: %s", e)
+            return
+        removed = workspaces.wipe_all()               # anything left by a crash or a hard stop goes now (never raises)
         if removed:
             logger.info("tether: removed %d leftover session workspace(s)", removed)
-        local_exec = LocalExec(workspaces)
+        local_exec = LocalExec(workspaces, record_dir=data_dir())
+        local_exec.reap_recorded()                    # background jobs left running by an earlier process
+        screen = ScreenExec(gate, local_exec)         # screen actions join their session's stop handles
+        gate.screen_drain = screen.drain              # the box opens only once no screen action is running (D65)
         pin = HostPin(data_dir())
         control = SessionControl(gate, workspaces, local_exec, lambda: (pin.get() or {}).get("fp", ""))
 
         def device_capabilities():
             caps = capabilities()
+            # consent_wait_seconds: the host's opening call waits this long plus start-up for the person here
             caps["rules"] = {**caps.get("rules", {}), "grant_idle_minutes": gate.idle_s / 60,
-                             "workspace_root": str(workspaces.root)}
+                             "consent_wait_seconds": gate.timeout_s, "workspace_root": str(workspaces.root)}
             return {**caps, "computer_use": screen.available()}
 
         rt.device = DeviceService(identity(s), pin, gate, s.name,
@@ -113,5 +191,9 @@ def _start_services(s, ctx) -> None:
                                    "close_session": control.close_session, "skill_put": control.skill_put},
                                   device_capabilities)
         rt.device.workspaces = workspaces
+        rt.device.seeds = seeds
+        seeds.refresh()        # reads the record again whenever another process (the setup command) changed it
+        rt.device.job_sweep = local_exec.sweep_jobs           # ends sessions whose grant ended (D39)
+        rt.device.busy_sessions = local_exec.busy_sessions    # ...but never one with a call in flight
         rt.loop.call_soon_threadsafe(rt.device.start)
         logger.info("tether: device role as %s", s.name)

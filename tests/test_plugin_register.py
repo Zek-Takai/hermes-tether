@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from unittest import mock
 from pathlib import Path
+from test_link_loopback import isolate_session, temp_dir  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(1, str(Path.home() / ".hermes" / "hermes-agent"))
@@ -41,9 +42,10 @@ class RegisterTests(unittest.TestCase):
             import agent.terminal_env_provider  # noqa: F401
         except Exception:  # noqa: BLE001
             self.skipTest("Hermes source not importable")
+        isolate_session(self)      # register() records this process's origin: never from a live session's shell
         self.plugin = load_plugin()
         self._home = os.environ.get("HERMES_HOME")
-        os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="hp-home-")     # never the real ~/.hermes
+        os.environ["HERMES_HOME"] = str(temp_dir(self, "hp-home-"))     # never the real ~/.hermes
         self.addCleanup(self._restore)
 
     def _restore(self):
@@ -60,8 +62,10 @@ class RegisterTests(unittest.TestCase):
     def kinds(self, ctx):
         return sorted(c[0] for c in ctx.calls)
 
+    # register_session_env is not a manifest surface (plugin.yaml is unchanged): it keeps the passphrase names out of
+    # Hermes's shell snapshots, in every process the plugin loads in, whatever the role.
     SURFACES = ["register_cli_command", "register_hook", "register_hook", "register_hook", "register_hook",
-                "register_middleware",
+                "register_middleware", "register_session_env",
                 "register_terminal_environment_provider", "register_tool"]
 
     def test_off_registers_inert_surfaces_only(self):
@@ -82,6 +86,63 @@ class RegisterTests(unittest.TestCase):
         self.assertEqual(provider.name, "tether")
         self.assertFalse(provider.skip_container_guards)       # Hermes approvals stay on
         self.assertTrue(provider.is_remote)
+
+    def _forget_passphrase(self):
+        """What register() held and masked is dropped again (the dummy value must not outlive the test)."""
+        sys.modules["hp_plugin_under_test.tether.identity"]._HELD.clear()
+        try:
+            from agent.redact import clear_vault_redaction_values
+            clear_vault_redaction_values()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def test_register_takes_the_passphrase_out_of_the_environment_in_every_role(self):
+        """register() is what removes the passphrase in every Hermes process (F95), whatever the role."""
+        self.addCleanup(self._forget_passphrase)
+        names = ("TETHER_KEY_PASSPHRASE", "HOMEPORT_KEY_PASSPHRASE")
+        for settings in ({}, {"role": "host", "listen": "127.0.0.1:9130"}, {"role": "device", "name": "mac"}):
+            for name in names:
+                os.environ[name] = "dummy-passphrase-value-123"
+            with mock.patch.object(self.plugin, "_in_gateway", return_value=False):
+                self.plugin.register(Ctx(settings))
+            for name in names:
+                self.assertFalse(name in os.environ, f"still in the environment with {settings or 'no role'}")
+
+    def test_a_bad_setting_does_not_leave_the_passphrase_in_the_environment(self):
+        """A typo in a setting fails the plugin's load; the passphrase is already out by then (F74)."""
+        self.addCleanup(self._forget_passphrase)
+        for settings in ({"role": "device", "name": "mac", "grant_idle_minutes": "ten"},
+                         {"role": "host", "listen": "127.0.0.1:91x0"}):
+            os.environ["TETHER_KEY_PASSPHRASE"] = "dummy-passphrase-value-123"
+            with mock.patch.object(self.plugin, "_in_gateway", return_value=False), self.assertRaises(ValueError):
+                self.plugin.register(Ctx(settings))
+            self.assertFalse("TETHER_KEY_PASSPHRASE" in os.environ, "still in the environment")
+
+    def test_a_missing_hermes_function_is_named_at_role_start(self):
+        """A Hermes update that drops a private function tether relies on is said in the log (F81)."""
+        import importlib
+        real = importlib.import_module
+
+        def without_review(name, *a, **k):
+            if name == "tools.skill_provenance":
+                raise ImportError(name)
+            return real(name, *a, **k)
+
+        with mock.patch.object(importlib, "import_module", without_review), \
+                self.assertLogs(self.plugin.logger, level="WARNING") as logs:
+            lost = self.plugin._check_hermes_surfaces()
+        self.assertEqual(lost, ["a background review is recognised by its thread name only"])
+        self.assertTrue(any("tools.skill_provenance.is_background_review" in line for line in logs.output))
+        self.assertEqual(self.plugin._check_hermes_surfaces(), [])       # Hermes 0.23.3 has every one
+    def test_register_records_whether_this_process_came_from_an_agents_shell(self):
+        """F84: register() is where the process origin is recorded, before any shell of this process runs. In a
+        Hermes started from an agent's shell (HERMES_SESSION_KEY in its environment) the answer is kept as True."""
+        handle = sys.modules["tether_runtime_handle"]
+        self.addCleanup(setattr, handle, "started_from_agent_shell", False)
+        handle.started_from_agent_shell = None                  # this process has not decided yet
+        with mock.patch.dict(os.environ, {"HERMES_SESSION_KEY": "agent:main:telegram:dm:1"}):
+            self.plugin.register(Ctx({}))
+        self.assertIs(handle.started_from_agent_shell, True)
 
     def test_source_never_names_the_computer_use_contract(self):
         # Hermes files any plugin whose source mentions it as kind "exclusive" (DESIGN.md, Packaging).

@@ -14,19 +14,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugin" / "tether"
 sys.path.insert(1, str(Path.home() / ".hermes" / "hermes-agent"))
 
 from tether import store  # noqa: E402
-from tether.consent import ConsentGate  # noqa: E402
 from tether.device import DeviceService  # noqa: E402
 
-from test_link_loopback import FakePrompt  # noqa: E402
+from test_link_loopback import temp_dir, FakePrompt, consent_gate  # noqa: E402
 
 
-def tmpdir() -> Path:
-    return Path(tempfile.mkdtemp(prefix="hp-panel-"))
+def tmpdir(test) -> Path:
+    return temp_dir(test, "hp-panel-")
 
 
 class EventLogTests(unittest.TestCase):
     def test_log_is_newest_first_short_and_bounded(self):
-        d = tmpdir()
+        d = tmpdir(self)
         store.log_event(d, "tethered", device="mac", session="20261107_223218_53ebf4")
         store.log_event(d, "untethered", device="mac", session="20261107_223218_53ebf4", reason="closed by the user",
                         empty="")
@@ -48,7 +47,7 @@ class EventLogTests(unittest.TestCase):
 
 class PanelSettingsTests(unittest.TestCase):
     def test_validated_and_bounded(self):
-        d = tmpdir()
+        d = tmpdir(self)
         self.assertEqual(store.write_panel_settings(d, {"grant_idle_minutes": 30}), {"grant_idle_minutes": 30.0})
         with self.assertRaisesRegex(ValueError, "between 1 and 1440"):
             store.write_panel_settings(d, {"grant_idle_minutes": 0})
@@ -56,13 +55,14 @@ class PanelSettingsTests(unittest.TestCase):
             store.write_panel_settings(d, {"role": "host"})                  # the panel can never change a role
         (d / store.SETTINGS_FILE).write_text(json.dumps({"grant_idle_minutes": 99999, "consent_timeout_seconds": 30}))
         self.assertEqual(store.read_panel_settings(d), {"consent_timeout_seconds": 30.0})   # out of range ignored
-        self.assertEqual(store.write_panel_settings(d, {"consent_timeout_seconds": 5}), {"consent_timeout_seconds": 5.0})
-        with self.assertRaisesRegex(ValueError, "between 5 and 600"):
-            store.write_panel_settings(d, {"consent_timeout_seconds": 4})
+        self.assertEqual(store.write_panel_settings(d, {"consent_timeout_seconds": 20}),
+                         {"consent_timeout_seconds": 20.0})
+        with self.assertRaisesRegex(ValueError, "between 20 and 600"):         # nobody reads a code in less (D63)
+            store.write_panel_settings(d, {"consent_timeout_seconds": 19})
 
     def test_device_applies_panel_settings_live_and_logs_it(self):
-        d = tmpdir()
-        gate = ConsentGate(idle_minutes=60, timeout_s=60, prompt=FakePrompt(True))
+        d = tmpdir(self)
+        gate = consent_gate(idle_minutes=60, timeout_s=60, prompt=FakePrompt(True))
         svc = DeviceService(None, store.HostPin(d), gate, "mac", {}, lambda: {})
         self.assertFalse(asyncio.run(svc.apply_panel_settings()))
         store.write_panel_settings(d, {"grant_idle_minutes": 5, "consent_timeout_seconds": 20})
@@ -72,21 +72,210 @@ class PanelSettingsTests(unittest.TestCase):
         self.assertEqual([e["kind"] for e in store.read_events(d)], ["settings_changed"])
 
 
+class UnlockedSettingTests(unittest.TestCase):
+    """H1 (D73): allow_unlocked_commands on the panel for Mac and PC; on by default on Windows, off on macOS; a change
+    reaches the device only while no remote session is connected."""
+
+    def setUp(self):
+        from tether import lock
+        self.lock = lock
+        self.addCleanup(lock.set_unlocked, None)
+
+    def test_defaults_per_platform(self):
+        from tether.config import read_settings
+        get = lambda key, default=None: "device" if key == "role" else default    # noqa: E731
+        with mock.patch.object(store.os, "name", "nt"):
+            self.assertTrue(read_settings(get).allow_unlocked_commands, "Windows: on by default")
+        with mock.patch.object(store.os, "name", "posix"):
+            self.assertFalse(read_settings(get).allow_unlocked_commands, "macOS: off by default")
+        explicit = lambda key, default=None: {"role": "device", "allow_unlocked_commands": "false"}.get(key, default)  # noqa: E731
+        with mock.patch.object(store.os, "name", "nt"):
+            self.assertFalse(read_settings(explicit).allow_unlocked_commands, "an explicit off wins on Windows")
+        self.lock.set_unlocked(None)
+        with mock.patch.object(self.lock, "_system", lambda: "windows"):
+            self.assertTrue(self.lock.unlocked(), "the lock module's own default on Windows")
+        with mock.patch.object(self.lock, "_system", lambda: "darwin"):
+            self.assertFalse(self.lock.unlocked(), "the lock module's own default on macOS")
+
+    def test_the_panel_stores_a_yes_or_no(self):
+        d = tmpdir(self)
+        self.assertEqual(store.write_panel_settings(d, {"allow_unlocked_commands": True}),
+                         {"allow_unlocked_commands": True})
+        with self.assertRaisesRegex(ValueError, "true or false"):
+            store.write_panel_settings(d, {"allow_unlocked_commands": "yes"})
+        (d / store.SETTINGS_FILE).write_text(json.dumps({"allow_unlocked_commands": 1}))
+        self.assertEqual(store.read_panel_settings(d), {}, "only a real yes/no counts")
+
+    def test_a_change_waits_until_no_session_is_connected(self):
+        d = tmpdir(self)
+        gate = consent_gate(idle_minutes=60, timeout_s=60, prompt=FakePrompt(True))
+        svc = DeviceService(None, store.HostPin(d), gate, "mac", {}, lambda: {})
+        self.lock.set_unlocked(False)
+        self.assertTrue(asyncio.run(gate.require("fp", "Test host", "s1")), "a live session")
+        store.write_panel_settings(d, {"allow_unlocked_commands": True})
+        asyncio.run(svc.apply_panel_settings())
+        self.assertFalse(self.lock.unlocked(), "a live session must not see its commands unlocked")
+        gate.revoke_all()
+        asyncio.run(svc.apply_panel_settings())
+        self.assertTrue(self.lock.unlocked(), "applied once no session is connected")
+        self.assertIn("unlocked commands on", store.read_events(d)[0].get("reason", ""))
+
+
 class ConsentLogTests(unittest.IsolatedAsyncioTestCase):
     async def test_allowed_and_denied_are_logged(self):
-        d = tmpdir()
+        d = tmpdir(self)
         prompt = FakePrompt(False)
-        gate = ConsentGate(idle_minutes=15, timeout_s=5, prompt=prompt)
+        now = [1000.0]
+        gate = consent_gate(idle_minutes=15, timeout_s=5, prompt=prompt, clock=lambda: now[0])
         gate.events_dir = d
         with self.assertRaises(PermissionError):
             await gate.require("fp", "Hermes on nas", "20261107_223218_53ebf4")
         prompt.answer = True
-        await gate.require("fp", "Hermes on nas", "20261107_223218_53ebf4")
+        with self.assertRaisesRegex(PermissionError, "refused moments ago"):     # no second prompt right away
+            await gate.require("fp", "Hermes on nas", "20261107_223218_53ebf4")
+        self.assertEqual(len(prompt.asked), 1)
+        now[0] += 61                                                             # the cool-down has passed
+        self.assertTrue(await gate.require("fp", "Hermes on nas", "20261107_223218_53ebf4"))
         kinds = [(e["kind"], e["session"]) for e in store.read_events(d)]
         self.assertEqual(kinds, [("allowed", "53ebf4"), ("denied", "53ebf4")])
 
 
+class GrantLifetimeTests(unittest.IsolatedAsyncioTestCase):
+    def gate(self, minutes):
+        self.mono, self.wall = [5000.0], [1_800_000_000.0]
+        self.prompt = FakePrompt(True)
+        return consent_gate(idle_minutes=minutes, timeout_s=5, prompt=self.prompt,
+                           clock=lambda: self.mono[0], wall=lambda: self.wall[0])
+
+    def tick(self, seconds, asleep=False):
+        self.wall[0] += seconds
+        if not asleep:                       # a sleeping machine's monotonic clock stands still
+            self.mono[0] += seconds
+
+    async def test_a_session_cannot_lengthen_its_own_stay(self):
+        gate = self.gate(1)
+        grant = await gate.require("fp", "host", "s1")
+        gate.set_idle_minutes(24 * 60)       # e.g. the session's own shell edited the panel settings file
+        self.tick(120)
+        self.assertEqual(gate.live_sessions(), set())                 # still gone after its own minute
+        self.assertTrue(await gate.require("fp", "host", "s1", token=grant))   # so the person is asked again
+        self.assertEqual(len(self.prompt.asked), 2)
+
+    async def test_the_limit_can_be_shortened_for_a_live_session(self):
+        gate = self.gate(60)
+        await gate.require("fp", "host", "s1")
+        gate.set_idle_minutes(1)
+        self.tick(120)
+        self.assertEqual(gate.live_sessions(), set())
+
+    async def test_time_asleep_counts_as_idle(self):
+        gate = self.gate(15)
+        grant = await gate.require("fp", "host", "s1")
+        self.tick(600)
+        self.assertIsNone(await gate.require("fp", "host", "s1", token=grant))  # used inside the window
+        self.tick(3600, asleep=True)         # the lid was closed for an hour
+        self.assertEqual(gate.live_sessions(), set())
+
+    async def test_the_prompt_shows_the_session_id_and_takes_no_caller_text(self):
+        """F54: the prompt names the session by its own id; a caller cannot put words of its choosing in its place."""
+        gate = self.gate(15)
+        with self.assertRaises(TypeError):
+            await gate.require("fp", "Hermes on nas", "20261107_223218_53ebf4", "20261107_223218_aaaaaa")
+        await gate.require("fp", "Hermes on nas", "20261107_223218_53ebf4")
+        self.assertIn("20261107_223218_53ebf4", self.prompt.asked[-1])
+
+
+class PromptLockTests(unittest.IsolatedAsyncioTestCase):
+    async def test_prompts_never_overlap_and_the_screen_stays_frozen(self):
+        """F85/D10.7: one prompt at a time, and the screen is frozen for as long as any prompt is open."""
+        seen, open_now = [], [0]
+        phone = FakePrompt(True).phone
+
+        async def slow(text, timeout_s):
+            open_now[0] += 1
+            seen.append((open_now[0], gate.screen_frozen))
+            await asyncio.sleep(0.1)
+            seen.append((open_now[0], gate.screen_frozen))
+            open_now[0] -= 1
+            return phone.code()
+        gate = consent_gate(idle_minutes=15, timeout_s=5, prompt=slow, phone=phone)
+        await asyncio.gather(gate.require("fp", "host", "s1"), gate.require("fp", "host", "s2"))
+        self.assertEqual(max(n for n, _ in seen), 1, "two prompts were on screen at once")
+        self.assertTrue(all(frozen for _, frozen in seen), "the screen thawed while a prompt was open")
+        self.assertFalse(gate.screen_frozen)
+
+
+class RunningCallTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_running_call_is_never_idle_and_the_clock_restarts_when_it_ends(self):
+        """F11/D44 at the gate: idle time counts from the end of the last call."""
+        mono = [5000.0]
+        gate = consent_gate(idle_minutes=15, timeout_s=5, prompt=FakePrompt(True), clock=lambda: mono[0],
+                           wall=lambda: 1.8e9 + mono[0])
+        grant = await gate.require("fp", "host", "s1")
+        gate.call_started("fp", "s1")
+        mono[0] += 20 * 60
+        self.assertEqual(gate.live_sessions(), {"s1"})
+        self.assertFalse(gate.release("fp", "s1", ""))
+        gate.call_ended("fp", "s1", grant)
+        mono[0] += 14 * 60
+        self.assertEqual(gate.live_sessions(), {"s1"})
+        mono[0] += 2 * 60
+        self.assertEqual(gate.live_sessions(), set())
+
+
+class PassiveCallTests(unittest.IsolatedAsyncioTestCase):
+    """A passive call (the host's own poll or stop of a background job) only rides a live Allow: it never asks,
+    never extends the session and never counts toward a refusal."""
+
+    def gate(self, minutes):
+        self.mono, self.wall = [5000.0], [1_800_000_000.0]
+        self.prompt = FakePrompt(True)
+        return consent_gate(idle_minutes=minutes, timeout_s=5, prompt=self.prompt,
+                           clock=lambda: self.mono[0], wall=lambda: self.wall[0])
+
+    def tick(self, seconds):
+        self.wall[0] += seconds
+        self.mono[0] += seconds
+
+    async def test_passive_call_does_not_extend_the_grant(self):
+        gate = self.gate(15)
+        grant = await gate.require("fp", "host", "s1")
+        self.tick(600)                                                   # t0 + 10 min
+        self.assertIsNone(await gate.require("fp", "host", "s1", token=grant, passive=True))
+        self.tick(360)                                                   # t0 + 16 min
+        self.assertEqual(gate.live_sessions(), set())                    # it lapsed: the poll did not count
+        self.assertEqual(len(self.prompt.asked), 1)
+
+    async def test_an_ordinary_call_does_extend_the_grant(self):
+        gate = self.gate(15)                                             # the same timeline, without passive
+        grant = await gate.require("fp", "host", "s1")
+        self.tick(600)
+        self.assertIsNone(await gate.require("fp", "host", "s1", token=grant))
+        self.tick(360)
+        self.assertEqual(gate.live_sessions(), {"s1"})
+
+    async def test_passive_call_without_a_live_allow_or_with_another_token_asks_nobody(self):
+        gate = self.gate(15)
+        with self.assertRaises(PermissionError):
+            await gate.require("fp", "host", "s1", passive=True)         # no grant at all
+        grant = await gate.require("fp", "host", "s1")
+        counters = (list(gate._asked), dict(gate._denied_until))
+        with self.assertRaises(PermissionError):
+            await gate.require("fp", "host", "s1", token="not-the-token", passive=True)
+        self.assertEqual(len(self.prompt.asked), 1)                      # no prompt was shown
+        self.assertEqual((list(gate._asked), dict(gate._denied_until)), counters)   # no cool-down, no rate count
+        self.assertIsNone(await gate.require("fp", "host", "s1", token=grant, passive=True))
+
+
 class DeviceLabelTests(unittest.TestCase):
+    def test_pairing_the_same_name_again_keeps_the_hosts_idle_limit(self):
+        """F66: a re-pair never quietly lifts the limit the host owner set for that device."""
+        pins = store.DevicePins(tmpdir(self))
+        pins.add("mac", "a" * 64, "PEM")
+        pins.update("mac", idle_minutes=5)
+        pins.add("mac", "a" * 64, "PEM")
+        self.assertEqual(pins.idle_minutes("mac"), 5.0)
+
     def test_labels_are_spoken_words(self):
         self.assertEqual(store.normalize_label("Studio PC"), "studio-pc")
         self.assertEqual(store.normalize_label("  studio_pc "), "studio-pc")
@@ -95,7 +284,7 @@ class DeviceLabelTests(unittest.TestCase):
                 store.normalize_label(bad)
 
     def test_rename_and_host_idle_limit(self):
-        d = tmpdir()
+        d = tmpdir(self)
         pins = store.DevicePins(d)
         pins.add("mac", "ab" * 32, "CERT")
         pins.add("pc", "cd" * 32, "CERT2")
@@ -112,7 +301,7 @@ class DeviceLabelTests(unittest.TestCase):
 
     def test_shorter_idle_limit_wins(self):
         from tether.runtime import Runtime
-        d = tmpdir()
+        d = tmpdir(self)
         pins = store.DevicePins(d)
         pins.add("mac", "ab" * 32, "CERT")
         rt = Runtime.__new__(Runtime)
@@ -130,11 +319,12 @@ class DeviceLabelTests(unittest.TestCase):
         from tether import device
         self.assertNotIn("hostname", device._local_facts())
         from tether.host import HostService
-        pins = store.DevicePins(tmpdir())
+        pins = store.DevicePins(tmpdir(self))
         pins.add("mac", "ab" * 32, "CERT")
         svc = HostService.__new__(HostService)
         svc.pins, svc.last_seen = pins, {}
-        conn = type("C", (), {"announce": {"os": "Darwin", "hostname": "Someones-MacBook"}, "link": {}})()
+        conn = type("C", (), {"announce": {"os": "Darwin", "hostname": "Someones-MacBook"}, "link": {},
+                              "fp": "ab" * 32})()
         svc.devices = {"mac": conn}
         row = svc.status()[0]
         self.assertNotIn("hostname", row["capabilities"])
@@ -143,10 +333,10 @@ class DeviceLabelTests(unittest.TestCase):
 
 class FollowHostPinTests(unittest.IsolatedAsyncioTestCase):
     async def test_device_follows_a_new_pairing_without_restart(self):
-        d = tmpdir()
+        d = tmpdir(self)
         pin = store.HostPin(d)
         pin.set(host="192.0.2.10", port=9130, fp="aa" * 32, cert_pem="A", host_label="Hermes on nas")
-        gate = ConsentGate(idle_minutes=15, timeout_s=5, prompt=FakePrompt(True))
+        gate = consent_gate(idle_minutes=15, timeout_s=5, prompt=FakePrompt(True))
         await gate.require("aa" * 32, "Hermes on nas", "s1")
         svc = DeviceService(None, pin, gate, "mac", {}, lambda: {})
 
@@ -186,20 +376,20 @@ except Exception:  # noqa: BLE001
 class PanelApiTests(unittest.TestCase):
     def setUp(self):
         import importlib.util
-        self.home = tmpdir()
-        os.environ["HERMES_HOME"] = str(self.home)
+        self.home = tmpdir(self)
+        env = mock.patch.dict(os.environ, {"HERMES_HOME": str(self.home)})   # restored exactly, even if unset before
+        env.start()
+        self.addCleanup(env.stop)
         spec = importlib.util.spec_from_file_location(
             "tether_panel_api_test", Path(__file__).resolve().parents[1] / "plugin" / "tether" / "dashboard" / "plugin_api.py")
         self.api = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.api)
         self.d = self.home / "tether"
 
-    def tearDown(self):
-        os.environ.pop("HERMES_HOME", None)
-
     def roles(self, role):
         return mock.patch.object(self.api, "_settings", lambda: {"roles": role, "name": "nas", "grant_idle_minutes": 60.0,
-                                                                  "consent_timeout_seconds": 60.0})
+                                                                  "consent_timeout_seconds": 60.0,
+                                                                  "allow_unlocked_commands": False})
 
     def test_host_status_lists_pairings_without_taking_the_link(self):
         self.d.mkdir(parents=True, exist_ok=True)
@@ -267,12 +457,30 @@ class PanelApiTests(unittest.TestCase):
 
 
 class DefaultTimeoutTests(unittest.TestCase):
-    def test_consent_wait_defaults_to_15_seconds(self):
+    def test_consent_wait_defaults_to_60_seconds(self):
         from tether.config import read_settings
         from tether.consent import ConsentGate
         self.assertEqual(read_settings(lambda key, default=None: "device" if key == "role" else default)
-                         .consent_timeout_seconds, 15.0)
-        self.assertEqual(ConsentGate(prompt=FakePrompt(True)).timeout_s, 15.0)
+                         .consent_timeout_seconds, 60.0)
+        self.assertEqual(ConsentGate(prompt=FakePrompt(True)).timeout_s, 60.0)    # time to unlock a phone and type
+
+
+@unittest.skipUnless(HAVE_FASTAPI, "fastapi not importable")
+class PanelEnvTests(unittest.TestCase):
+    def test_panel_setup_and_teardown_leave_hermes_home_as_found(self):
+        with mock.patch.dict(os.environ, {"HERMES_HOME": "/sentinel/home"}):
+            t = PanelApiTests("test_host_status_lists_pairings_without_taking_the_link")
+            t.setUp()
+            t.tearDown()
+            t.doCleanups()
+            self.assertEqual(os.environ.get("HERMES_HOME"), "/sentinel/home")
+        with mock.patch.dict(os.environ):
+            os.environ.pop("HERMES_HOME", None)
+            t = PanelApiTests("test_host_status_lists_pairings_without_taking_the_link")
+            t.setUp()
+            t.tearDown()
+            t.doCleanups()
+            self.assertFalse("HERMES_HOME" in os.environ, "still in the environment")
 
 
 if __name__ == "__main__":

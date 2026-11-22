@@ -1,16 +1,21 @@
 """Device side of remote computer use: each call runs on this machine's own computer-use backend (its
 driver, its macOS permissions) in ``standard`` mode (design §3, D14). Approvals for the actions happen on
 the host session, exactly as Hermes asks for local use; this side adds the consent grant (D10) and the
-screen freeze: while a consent prompt is open, no input from any session reaches the screen (D10.7).
+screen freeze: while the approval box is open, no action from any session reaches the screen, screenshots
+included, and an action already running is waited for before the box opens (D10.7, D65).
 Screenshots travel in the frame body (base64 text, as the backend produced it).
 """
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import dataclasses
 import logging
 import threading
 from typing import Any, Optional
+
+from .consent import FROZEN_TEXT
+from .device_exec import _run_stoppable, _Stop, _stop_pending
 
 logger = logging.getLogger(__name__)
 
@@ -20,10 +25,20 @@ SELF_NAME = "tether_screen"
 
 
 class ScreenExec:
-    def __init__(self, consent) -> None:
+    def __init__(self, consent, local_exec=None) -> None:
         self.consent = consent
+        self.local_exec = local_exec           # its per-session stop handles: a close stops a session's waiting actions
         self._backend = None
-        self._lock = threading.Lock()          # one driver, one action at a time
+        self._lock = threading.Lock()          # the backend is made and stopped under it
+        # One driver, one action at a time, on a thread of its own. An action waiting its turn holds no thread, so a
+        # driver call that never returns cannot use up the threads terminal, file and close calls need; a waiting
+        # action that is stopped leaves the queue without running (F63).
+        self._pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
+
+    def _executor(self) -> concurrent.futures.ThreadPoolExecutor:
+        if self._pool is None:
+            self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="tether-screen")
+        return self._pool
 
     def _get_backend(self):
         if self._backend is None:
@@ -35,6 +50,18 @@ class ScreenExec:
             backend.start()
             self._backend = backend
         return self._backend
+
+    def _idle(self, timeout: float) -> bool:
+        if self._lock.acquire(timeout=timeout):        # taken and given back in this same thread: never left held
+            self._lock.release()
+            return True
+        return False
+
+    async def drain(self, timeout: float) -> bool:
+        """The approval box is about to open and screen_frozen is already set: wait until no action is inside the
+        driver (one that started before the freeze finishes; every later one sees the freeze and is refused).
+        False when one is still running after ``timeout`` seconds: the box is then not shown (D65)."""
+        return await asyncio.to_thread(self._idle, timeout)
 
     def available(self) -> bool:
         try:
@@ -55,18 +82,28 @@ class ScreenExec:
         method = str(args.get("method") or "")
         if method not in INPUT_METHODS | READ_METHODS:
             raise ValueError(f"unknown computer-use method {method!r}")
-        if method in INPUT_METHODS and self.consent.screen_frozen:
-            raise PermissionError("screen input is frozen on this device while a consent prompt is open")
+        if self.consent.screen_frozen:              # every action, screenshots included, while the box is open (D65)
+            raise PermissionError(FROZEN_TEXT)
         kwargs = dict(args.get("kwargs") or {})
         for k in ("from_xy", "to_xy"):
             if isinstance(kwargs.get(k), list):
                 kwargs[k] = tuple(kwargs[k])
-        return await asyncio.to_thread(self._run, method, kwargs)
+        # The action joins its session's stop handles before it waits for the driver: closing the session (or the
+        # device's Pause, which drops the link) keeps it off the screen.
+        stop = _Stop()
+        stops = None
+        if self.local_exec is not None:
+            stops = self.local_exec.stops_for(str(args.get("session") or "default"), stop)
+        return await _run_stoppable(self._run, method, kwargs, stops=stops, stop=stop, executor=self._executor())
 
     def _run(self, method: str, kwargs: dict[str, Any]) -> tuple[dict[str, Any], bytes]:
         with self._lock:
-            if method in INPUT_METHODS and self.consent.screen_frozen:      # re-check under the lock
-                raise PermissionError("screen input is frozen on this device while a consent prompt is open")
+            if self.consent.screen_frozen:                                   # re-check under the lock
+                raise PermissionError(FROZEN_TEXT)
+            # A stop that landed while this action waited for the driver keeps it off the screen. An action already
+            # inside the driver is not interrupted: the driver has no way to cancel one, so it finishes.
+            if _stop_pending():
+                raise InterruptedError("stopped before it started")
             result = getattr(self._get_backend(), method)(**kwargs)
         return pack(result)
 

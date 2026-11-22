@@ -66,12 +66,16 @@ class ScreenTests(unittest.TestCase):
         cls.screen._backend = cls.fake
         cls.rig.device._handlers = {"cu": cls.screen.call}
 
+        cls.addClassCleanup(cls.rig.close)
+
         async def up():
             _, task = await cls.rig.pair()
             await task
             await cls.rig.connect()
         cls.rt.run(up(), 30)
         cls.rt.host = cls.rig.host
+        for table in (cls.rt.grants, cls.rt.grant_fp, cls.rt.open_fp):   # another module's rig, another key (D43)
+            table.clear()
         cls.rt.targets["default"] = "mac"
         cls.rt.turn_open["default"] = True
         os.environ.pop("HERMES_SESSION_ID", None)
@@ -100,15 +104,43 @@ class ScreenTests(unittest.TestCase):
         self.assertTrue(self.backend.drag(from_xy=(1, 2), to_xy=(3, 4)).ok)
         self.assertEqual(self.backend.list_apps(), [{"name": "Finder", "pid": 1}])
 
-    def test_frozen_screen_refuses_input_but_not_reads(self):
+    def test_frozen_screen_refuses_every_action_screenshots_included(self):
+        """D65 (threat 2): while the approval box is open no session's action reaches the screen, and no screenshot
+        is taken either (base: a capture went through)."""
         self.rig.consent.screen_frozen = True
+        before = len(self.fake.calls)
         try:
             r = self.backend.click(x=5, y=5)
             self.assertFalse(r.ok)
-            self.assertIn("frozen", r.message)
-            self.assertEqual(self.backend.capture().width, 1512)
+            self.assertIn("approval box is open", r.message)
+            with self.assertRaisesRegex(Exception, "approval box is open"):
+                self.backend.capture()
+            with self.assertRaisesRegex(Exception, "approval box is open"):
+                self.backend.list_apps()
         finally:
             self.rig.consent.screen_frozen = False
+        self.assertEqual(len(self.fake.calls), before, "a screen action reached the driver while the box was open")
+
+    def test_a_stopped_action_that_has_not_started_is_not_carried_out(self):
+        # The action waits for the driver (one action at a time). A stop that lands while it waits keeps it off screen.
+        import asyncio
+        from tether.device_screen import ScreenExec
+        fake = FakeBackend()
+        screen = ScreenExec(self.rig.consent)
+        screen._backend = fake
+
+        async def scenario():
+            screen._lock.acquire()                    # another action holds the driver
+            task = asyncio.create_task(screen.call({"method": "click", "kwargs": {"x": 1, "y": 1}}, b""))
+            await asyncio.sleep(0.2)                  # the click is waiting for the driver
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            screen._lock.release()                    # the worker gets the driver only now
+            await asyncio.sleep(0.5)
+
+        asyncio.run(scenario())
+        self.assertFalse(any(c[0] == "click" for c in fake.calls), "a stopped screen action was carried out")
 
     def test_no_device_selected(self):
         self.rt.targets["default"] = "local"

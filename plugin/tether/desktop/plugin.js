@@ -65,12 +65,21 @@ function describe(e) {
     case 'device_renamed': return `Renamed to ${dev}${why}`
     case 'paused': return 'Remote use paused'
     case 'resumed': return 'Remote use resumed'
+    case 'authenticator': return `Authenticator${why}`
+    case 'authenticator_set_up': return 'Authenticator set up'
+    case 'authenticator_replaced': return 'Authenticator replaced'
+    case 'authenticator_removed': return 'Authenticator removed: remote use is off'
+    case 'authenticator_setup_stopped': return `Authenticator setup stopped${why}`
+    case 'recovery_codes_renewed': return 'New recovery codes made'
+    case 'recovery_code_used': return `Recovery code used${why}`
+    case 'settings_code_wrong': return `Wrong code for the authenticator settings${why}`
+    case 'code_entry_unlocked': return 'Code entry unlocked'
     default: return `${e.kind}${why}`
   }
 }
 
 function tone(kind) {
-  if (['denied', 'connection_refused', 'device_disconnected', 'host_disconnected', 'paused'].includes(kind)) return BAD
+  if (['denied', 'connection_refused', 'device_disconnected', 'host_disconnected', 'paused', 'authenticator_removed', 'settings_code_wrong'].includes(kind)) return BAD
   if (['allowed', 'tethered', 'device_connected', 'host_connected', 'resumed'].includes(kind)) return OK
   return OFF
 }
@@ -167,6 +176,39 @@ function NumberSetting({ label, hint, value, unit, field, limits, onSaved }) {
   })
 }
 
+// allow_unlocked_commands (D73). macOS: off by default, every remote command runs inside the session lock; on runs
+// them without it. Windows has no lock: on by default, and off means remote commands do not run at all.
+function UnlockedSetting({ dv, onSaved }) {
+  const [msg, setMsg] = useState('')
+  const on = !!dv.allow_unlocked_commands
+  const mac = dv.system === 'macos'
+  const save = async (value) => {
+    try {
+      const res = await rest('/settings', { method: 'PUT', body: { allow_unlocked_commands: value } })
+      setMsg(`Saved; ${res?.note || 'applies once no remote session is connected'}.`)
+      onSaved()
+    } catch (e) {
+      setMsg(String(e?.message || e))
+    }
+  }
+  const hint = mac
+    ? (on ? 'On: remote commands run without the session lock, so they can read and change Tether\'s and Hermes\'s own files on this Mac (the authenticator\'s secret included).'
+          : 'Off (recommended): remote commands run inside the session lock, which keeps them away from Tether\'s and Hermes\'s own files.')
+    : (on ? 'On: remote commands run with your full rights (Windows has no session lock), so they can read and change Tether\'s and Hermes\'s own files on this PC.'
+          : 'Off: remote commands are refused on this PC; file tools and computer use still work.')
+  return jsxs('div', {
+    className: 'flex flex-col gap-1',
+    children: [
+      jsxs('div', { className: 'flex items-center gap-2', children: [
+        dot(on && mac ? BAD : OK),
+        jsx('span', { className: 'text-sm', children: `Run remote commands unlocked: ${on ? 'on' : 'off'}` }),
+        jsx(Button, { size: 'sm', variant: 'outline', onClick: () => void save(!on), children: on ? 'Turn off' : 'Turn on' })
+      ] }),
+      jsx('div', { className: 'text-xs opacity-60', children: msg || hint })
+    ]
+  })
+}
+
 function TetherPane({ ctx }) {
   const [data, setData] = useState(null)
   const [error, setError] = useState('')
@@ -227,8 +269,18 @@ function TetherPane({ ctx }) {
         jsx('span', { className: 'text-sm', children: dv.paused ? 'Remote use paused' : 'Remote use allowed when you approve it' }),
         jsx(Button, { size: 'sm', variant: 'outline', onClick: async () => { await rest('/pause', { method: 'POST', body: { paused: !dv.paused } }); void refresh() }, children: dv.paused ? 'Resume' : 'Pause' })
       ] }),
+      jsxs('div', { className: 'flex items-center gap-2', children: [
+        dot(dv.authenticator === 'on' ? OK : BAD),
+        jsx('span', { className: 'text-sm', children: dv.authenticator === 'on'
+          ? 'Authenticator on: each new session asks for a code from your app on this screen'
+          : dv.authenticator === 'unknown'
+            ? 'Authenticator set up; is this machine\'s Hermes running? (hermes tether status)'
+            : (dv.authenticator === 'damaged' ? 'Authenticator damaged: remote use is off' : 'Authenticator not set up: remote use is off')
+              + '. Set it up in a terminal here: hermes tether authenticator setup' })
+      ] }),
       jsx(NumberSetting, { label: 'Idle limit', unit: 'minutes', field: 'grant_idle_minutes', value: dv.grant_idle_minutes, limits: dv.limits?.grant_idle_minutes, hint: 'A session closes after this long without use; the next use asks you again.', onSaved: refresh }),
-      jsx(NumberSetting, { label: 'Consent wait', unit: 'seconds', field: 'consent_timeout_seconds', value: dv.consent_timeout_seconds, limits: dv.limits?.consent_timeout_seconds, hint: 'How long the allow/deny prompt waits; no answer means deny.', onSaved: refresh }),
+      jsx(NumberSetting, { label: 'Code box wait', unit: 'seconds', field: 'consent_timeout_seconds', value: dv.consent_timeout_seconds, limits: dv.limits?.consent_timeout_seconds, hint: 'How long the approval box waits for a code from your authenticator app; no code means deny.', onSaved: refresh }),
+      jsx(UnlockedSetting, { dv, onSaved: refresh }),
       jsx('div', { className: 'text-xs opacity-60', children: 'These belong to this machine; the host cannot change them.' })
     ]))
   }
