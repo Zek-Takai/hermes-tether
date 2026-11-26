@@ -9,6 +9,8 @@ is missing.
 
 ### Changed
 
+- **The manifest lists only the hooks Tether registers:** `post_tool_call` is gone (0.3.0 used it to clear its gate
+  handoff; 0.3.1 reads Hermes's command context instead).
 - **Hermes's checks of a file call sent to a device** run through Hermes's `authorize_tool_call` instead of Tether
   calling Hermes's internal hook runner, guard constants and guardrails after finding its caller on the call stack.
   Hermes applies `post_tool_call` and `transform_tool_result` to the device's result itself.
