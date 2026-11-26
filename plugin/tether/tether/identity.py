@@ -128,17 +128,21 @@ def _mask_in_output(value: str) -> None:
     is the same folder spelled another way (a home reached through a symlink: resolved while plugins load, as
     written at run time, F48). shield_children refreshes it under each tool call's own home."""
     try:
-        from agent.redact_vault_values import register_vault_redaction_value
+        from agent.redact_vault_values import register_plugin_redaction_value
     except Exception:  # noqa: BLE001 - this Hermes lacks it: say so once, the plugin's own masking still applies
         _warn_once("mask", "tether: this Hermes cannot mask the key passphrase in its own tool output "
-                           "(agent.redact_vault_values is missing)")
+                           "(agent.redact_vault_values.register_plugin_redaction_value is missing)")
         return
-    register_vault_redaction_value(value)
+    try:
+        register_plugin_redaction_value(value)
+    except ValueError:      # Hermes masks values of 8 characters or more; the plugin's own masking still applies
+        _warn_once("mask-short", "tether: the key passphrase is too short for Hermes to mask it in its own tool output")
+        return
     try:
         from hermes_constants import get_hermes_home, get_process_hermes_home, hermes_home_key
         here, process = str(get_hermes_home()), str(get_process_hermes_home())
         if process != here and hermes_home_key(process) == hermes_home_key(here):
-            contextvars.copy_context().run(_register_mask_as, process, value, register_vault_redaction_value)
+            contextvars.copy_context().run(_register_mask_as, process, value, register_plugin_redaction_value)
     except Exception:  # noqa: BLE001 - the mask for the caller's own spelling is in place
         pass
 

@@ -214,6 +214,8 @@ OPEN_LOCK_WAIT_S = 2.0               # how long a record change waits for the fo
 
 
 def process_alive(pid: Any) -> bool:
+    if os.name == "nt":                  # os.kill(pid, 0) ends the process on Windows: only ask about it there
+        return _windows_process_alive(pid)
     try:
         os.kill(int(pid), 0)
     except (ProcessLookupError, ValueError, TypeError, OverflowError):
@@ -221,6 +223,32 @@ def process_alive(pid: Any) -> bool:
     except PermissionError:           # it exists, under another user
         return True
     return True
+
+
+def _windows_process_alive(pid: Any) -> bool:
+    """Windows: open the process for query only and read whether it is still running (STILL_ACTIVE)."""
+    try:
+        pid = int(pid)
+    except (ValueError, TypeError, OverflowError):
+        return False
+    if pid <= 0:
+        return False
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    k32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    query_limited, access_denied, still_active = 0x1000, 5, 259
+    handle = k32.OpenProcess(query_limited, False, pid)
+    if not handle:
+        return ctypes.get_last_error() == access_denied   # it exists, under another user
+    try:
+        code = wintypes.DWORD()
+        return bool(k32.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value == still_active
+    finally:
+        k32.CloseHandle(handle)
 
 
 class OpenSessions:

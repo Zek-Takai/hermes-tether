@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-HERMES_SRC = Path.home() / ".hermes" / "hermes-agent"
+HERMES_SRC = Path(os.environ.get("HERMES_AGENT_SRC") or Path.home() / ".hermes" / "hermes-agent")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugin" / "tether"))
 sys.path.insert(1, str(HERMES_SRC))
 

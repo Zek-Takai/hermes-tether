@@ -20,7 +20,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "plugin" / "tether"))
-sys.path.insert(1, str(Path.home() / ".hermes" / "hermes-agent"))
+sys.path.insert(1, str(Path(os.environ.get("HERMES_AGENT_SRC") or Path.home() / ".hermes" / "hermes-agent")))
 
 from tether import authcode, consent, frames  # noqa: E402
 from tether.authcode import CodeChecker, MemorySeedStore  # noqa: E402
@@ -271,7 +271,8 @@ class CodeCheckerTests(unittest.TestCase):
                                                  "mac"})
         for secret in secret_forms(self.seed, [code]):
             self.assertFalse(secret.found_in(text), "a code or the seed is in the state file")
-        self.assertEqual([p.name for p in folder.iterdir()], [authcode.STATE_FILE], "a temporary file was left")
+        kept = {authcode.STATE_FILE} | ({authcode.LOCK_FILE} if os.name == "nt" else set())   # Windows locks a file
+        self.assertEqual({p.name for p in folder.iterdir()}, kept, "a temporary file was left")
 
 
 def secret_forms(seed: bytes, codes) -> list["Secret"]:

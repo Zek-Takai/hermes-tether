@@ -18,7 +18,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugin" / "tether"))
-sys.path.insert(1, str(Path.home() / ".hermes" / "hermes-agent"))
+sys.path.insert(1, str(Path(os.environ.get("HERMES_AGENT_SRC") or Path.home() / ".hermes" / "hermes-agent")))
 
 from tether.device_exec import LocalExec, SessionControl, job_paths  # noqa: E402
 from tether.provider import _spawn_text  # noqa: E402

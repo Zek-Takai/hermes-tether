@@ -11,7 +11,7 @@ from pathlib import Path
 from test_link_loopback import isolate_session, temp_dir  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(1, str(Path.home() / ".hermes" / "hermes-agent"))
+sys.path.insert(1, str(Path(os.environ.get("HERMES_AGENT_SRC") or Path.home() / ".hermes" / "hermes-agent")))
 
 
 def load_plugin():
@@ -64,7 +64,7 @@ class RegisterTests(unittest.TestCase):
 
     # register_session_env is not a manifest surface (plugin.yaml is unchanged): it keeps the passphrase names out of
     # Hermes's shell snapshots, in every process the plugin loads in, whatever the role.
-    SURFACES = ["register_cli_command", "register_hook", "register_hook", "register_hook", "register_hook",
+    SURFACES = ["register_cli_command", "register_hook", "register_hook", "register_hook",
                 "register_middleware", "register_session_env",
                 "register_terminal_environment_provider", "register_tool"]
 
@@ -73,7 +73,7 @@ class RegisterTests(unittest.TestCase):
         self.plugin.register(ctx)
         self.assertEqual(self.kinds(ctx), self.SURFACES)          # declared == registered (catalog validator)
         hooks = sorted(c[1][0] for c in ctx.calls if c[0] == "register_hook")
-        self.assertEqual(hooks, ["post_llm_call", "post_tool_call", "pre_llm_call", "transform_tool_result"])
+        self.assertEqual(hooks, ["post_llm_call", "pre_llm_call", "transform_tool_result"])
         mw = next(c for c in ctx.calls if c[0] == "register_middleware")
         self.assertEqual(mw[1][0], "tool_execution")
 
@@ -119,7 +119,7 @@ class RegisterTests(unittest.TestCase):
             self.assertFalse("TETHER_KEY_PASSPHRASE" in os.environ, "still in the environment")
 
     def test_a_missing_hermes_function_is_named_at_role_start(self):
-        """A Hermes update that drops a private function tether relies on is said in the log (F81)."""
+        """A Hermes that lacks a public seam tether relies on is said in the log (F81)."""
         import importlib
         real = importlib.import_module
 
@@ -133,7 +133,28 @@ class RegisterTests(unittest.TestCase):
             lost = self.plugin._check_hermes_surfaces()
         self.assertEqual(lost, ["a background review is recognised by its thread name only"])
         self.assertTrue(any("tools.skill_provenance.is_background_review" in line for line in logs.output))
-        self.assertEqual(self.plugin._check_hermes_surfaces(), [])       # Hermes 0.23.3 has every one
+        self.assertEqual(self.plugin._check_hermes_surfaces(), [])       # this Hermes has every seam
+    def test_a_missing_hermes_attribute_seam_is_named(self):
+        """Gauntlet 3.1 F1: seam G is an attribute, not a function; its absence is named too."""
+        from tools.environments.base import BaseEnvironment
+        with mock.patch.object(BaseEnvironment, "supports_session_kernel", None), \
+                self.assertLogs(self.plugin.logger, level="WARNING") as logs:
+            lost = self.plugin._check_hermes_surfaces()
+        self.assertEqual(len(lost), 1)
+        self.assertIn("execute_code is refused over tether", lost[0])
+        self.assertTrue(any("BaseEnvironment.supports_session_kernel" in line for line in logs.output))
+
+    def test_inert_in_hermes_plugin_host_process(self):
+        """Gauntlet 3.1 lock F2: in Hermes's separate plugin host no session or turn crosses over; tether starts
+        nothing there whatever its role."""
+        started = []
+        with mock.patch.dict(os.environ, {"HERMES_PLUGIN_HOST_PROCESS": "1"}), \
+                mock.patch.object(self.plugin, "_start_services", lambda *a: started.append(a)), \
+                self.assertLogs(self.plugin.logger, level="WARNING") as logs:
+            self.plugin.register(Ctx({"role": "host"}))
+        self.assertEqual(started, [])
+        self.assertTrue(any("plugin host process" in line for line in logs.output))
+
     def test_register_records_whether_this_process_came_from_an_agents_shell(self):
         """F84: register() is where the process origin is recorded, before any shell of this process runs. In a
         Hermes started from an agent's shell (HERMES_SESSION_KEY in its environment) the answer is kept as True."""

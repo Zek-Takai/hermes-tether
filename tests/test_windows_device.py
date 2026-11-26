@@ -13,7 +13,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugin" / "tether"))
 
-from tether import consent, workspace  # noqa: E402
+from tether import consent, device_exec, store, workspace  # noqa: E402
 from test_link_loopback import temp_dir  # noqa: E402
 
 
@@ -129,6 +129,83 @@ class ReservedNameWipeTests(unittest.TestCase):
         self.assertEqual(workspace._extended("C:\\Users\\z\\nul"), "\\\\?\\C:\\Users\\z\\nul")
         self.assertEqual(workspace._extended("\\\\srv\\share\\w"), "\\\\?\\UNC\\srv\\share\\w")
         self.assertEqual(workspace._extended("\\\\?\\C:\\w"), "\\\\?\\C:\\w")
+
+
+class Python3ShimTests(unittest.TestCase):
+    """Hermes's remote execute_code runs python3; on Windows that is usually only the Microsoft Store's alias."""
+
+    def test_no_shim_off_windows(self):
+        if os.name == "nt":
+            self.skipTest("Windows")
+        d = temp_dir(self, "hp-shim-")
+        self.assertEqual(device_exec._python3_shim(d), {})
+        self.assertFalse((d / device_exec.SHIM_DIR).exists())
+
+    def test_a_store_alias_gets_a_shim_to_this_hermes_python(self):
+        d = temp_dir(self, "hp-shim-")
+        alias = "C:\\Users\\x\\AppData\\Local\\Microsoft\\WindowsApps\\python3.EXE"
+        with mock.patch.object(device_exec.os, "name", "nt"), mock.patch("shutil.which", lambda *a, **k: alias), \
+                mock.patch.dict(os.environ, {"PATH": "base"}):
+            extra = device_exec._python3_shim(d)
+        shim = d / device_exec.SHIM_DIR / "python3"
+        self.assertEqual(extra, {"PATH": str(shim.parent) + os.pathsep + "base", "ORIGINAL_PATH": None})
+        text = shim.read_bytes()
+        self.assertNotIn(b"\r", text)                                      # Git Bash reads it as a script
+        self.assertIn(Path(sys.executable).as_posix().encode(), text.replace(b"pythonw.exe", b"python.exe"))
+
+    def test_a_python3_in_windowsapps_that_runs_is_left_alone(self):
+        """The Python Install Manager's python3 lives under Program Files\\WindowsApps and is a real Python."""
+        d = temp_dir(self, "hp-shim-")
+        manager = "C:\\\\Program Files\\\\WindowsApps\\\\PythonSoftwareFoundation.PythonManager_26.4\\\\python3.exe"
+        with mock.patch.object(device_exec.os, "name", "nt"), mock.patch("shutil.which", lambda *a, **k: manager), \
+                mock.patch.object(device_exec, "_runs_python3", return_value=True) as probe:
+            self.assertEqual(device_exec._python3_shim(d), {})
+        probe.assert_called_once_with(manager)
+        self.assertFalse((d / device_exec.SHIM_DIR).exists())
+
+    def test_the_probe_runs_python3_only_when_it_answers(self):
+        self.assertTrue(device_exec._runs_python3(sys.executable))
+        self.assertFalse(device_exec._runs_python3(str(temp_dir(self, "hp-shim-") / "no-such-python3")))
+
+    def test_a_real_python3_is_left_alone(self):
+        d = temp_dir(self, "hp-shim-")
+        with mock.patch.object(device_exec.os, "name", "nt"), \
+                mock.patch("shutil.which", lambda *a, **k: "C:\\Python313\\python3.exe"):
+            self.assertEqual(device_exec._python3_shim(d), {})
+        self.assertFalse((d / device_exec.SHIM_DIR).exists())
+
+    def test_a_link_in_place_of_the_shim_folder_is_never_written_through(self):
+        d, other = temp_dir(self, "hp-shim-"), temp_dir(self, "hp-other-")
+        try:
+            os.symlink(other, d / device_exec.SHIM_DIR, target_is_directory=True)
+        except OSError:
+            self.skipTest("no symlink rights here")
+        with mock.patch.object(device_exec.os, "name", "nt"), mock.patch("shutil.which", lambda *a, **k: None):
+            self.assertEqual(device_exec._python3_shim(d), {})
+        self.assertEqual(list(other.iterdir()), [])
+
+
+class ProcessAliveTests(unittest.TestCase):
+    """os.kill(pid, 0) ends the process on Windows: the liveness check there only asks."""
+
+    def test_windows_never_signals(self):
+        with mock.patch.object(store.os, "name", "nt"), \
+                mock.patch.object(store.os, "kill", side_effect=AssertionError("signalled")), \
+                mock.patch.object(store, "_windows_process_alive", return_value=True) as ask:
+            self.assertTrue(store.process_alive(1234))
+        ask.assert_called_once_with(1234)
+
+    @unittest.skipUnless(os.name == "nt", "Windows process query")
+    def test_a_live_process_is_seen_and_left_running(self):
+        import subprocess
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.addCleanup(lambda: (child.poll() is None and child.kill(), child.wait()))
+        self.assertTrue(store.process_alive(child.pid))
+        self.assertIsNone(child.poll(), "the check ended the process")
+        child.kill()
+        child.wait()
+        self.assertFalse(store.process_alive(child.pid))
+        self.assertFalse(store.process_alive("not a pid"))
 
 
 if __name__ == "__main__":

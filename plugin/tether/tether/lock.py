@@ -20,8 +20,11 @@ changes what LockedEnvironment copies is checked by the maintainers before a rel
 """
 from __future__ import annotations
 
+import contextlib
+
 import logging
 import os
+import shlex
 import re
 import shutil
 import subprocess
@@ -469,19 +472,51 @@ def locked_environment(*, cwd: str, timeout: int, env: dict, workspace: str) -> 
     global _LOCKED_CLASS
     if _LOCKED_CLASS is None:
         _LOCKED_CLASS = _make_locked_class()
-    return _LOCKED_CLASS(cwd=cwd, timeout=timeout, env=env, workspace=workspace)
+    terminal = _LOCKED_CLASS(cwd=cwd, timeout=timeout, env=env, workspace=workspace)
+    try:
+        _check_applied(terminal)
+    except BaseException:
+        with contextlib.suppress(Exception):
+            terminal.cleanup()
+        raise
+    return terminal
+
+
+NOT_APPLIED = ("tether: this device's Hermes did not run the session's commands inside the session lock ({why}), so "
+               "no remote command runs here. Update Tether and Hermes together.")
+
+
+def _check_applied(terminal: Any) -> None:
+    """The lock holds only if Hermes sends this terminal's processes through wrap_argv (gauntlet 3.1 F2). Checked
+    when the terminal is made, with one probe command: it must go through the hook (whose profile is built and
+    verified there; a profile the system refuses keeps its own reason), and, where this device has a protected Hermes
+    file this process can read, the probe must not be able to read it. Any failure: LockError."""
+    target = next((p for p in protected_set().scan_files if os.path.isfile(p) and os.access(p, os.R_OK)), None)
+    probe = f"cat {shlex.quote(target)} >/dev/null 2>&1" if target else "true"
+    result = terminal.execute(probe, timeout=30)
+    error = getattr(terminal, "_tether_error", None)
+    if error is not None:
+        raise error
+    if getattr(terminal, "_tether_profile", None) is None:
+        raise LockError(NOT_APPLIED.format(why="its commands did not go through the lock"))
+    if target and int(result.get("returncode", 1)) == 0:
+        raise LockError(NOT_APPLIED.format(why="a protected file was readable"))
 
 
 def _make_locked_class() -> Any:
-    import tools.environments.local as L
     from tools.environments.local import LocalEnvironment
 
     class LockedEnvironment(LocalEnvironment):
-        """Every process this terminal starts runs as /usr/bin/sandbox-exec -p <this session's profile> <command>."""
+        """Every process this terminal starts runs as /usr/bin/sandbox-exec -p <this session's profile> <command>,
+        through Hermes's public LocalEnvironment.wrap_argv hook (its commands, its login shell and its long-lived
+        children). A confined LocalEnvironment sends Hermes's file tools through execute(), so they see what its
+        commands see (Hermes sets uses_host_filesystem False for it)."""
 
         def __init__(self, *, workspace: str, **kwargs: Any) -> None:
             self._tether_workspace = str(workspace)
             self._tether_profile: Optional[str] = None
+            self._tether_error: Optional[BaseException] = None    # the first reason the lock could not start
+            self._tether_run_env: Optional[dict] = None
             self._tether_lock = threading.Lock()
             super().__init__(**kwargs)          # init_session starts the first (login) shell: already locked
 
@@ -495,60 +530,21 @@ def _make_locked_class() -> Any:
                     self._tether_profile = profile
                 return [SANDBOX_EXEC, "-p", self._tether_profile]
 
+        def wrap_argv(self, argv: list[str], env: dict, *, purpose: str) -> list[str]:
+            if purpose in ("command", "login"):
+                self._tether_run_env = dict(env)        # the environment this terminal's commands get
+            try:
+                return [*self._tether_prefix(env), *argv]
+            except LockError as e:
+                self._tether_error = self._tether_error or e
+                raise
+
         def tether_box_spec(self) -> tuple[list[str], dict, str]:
             """(the sandbox prefix with this session's profile, the environment its commands get, its temp folder):
-            what the session's file-tool helper is started with (filebox, D79), so it runs in the same lock."""
-            run_env = L._make_run_env(self.env)
+            what the session's file-tool helper is started with (filebox, D79), so it runs in the same lock. The
+            environment is the one Hermes handed wrap_argv for this terminal's shell (its login shell ran at start)."""
+            run_env = dict(self._tether_run_env or {})
             return self._tether_prefix(run_env), run_env, self.get_temp_dir()
-
-        def _run_bash(self, cmd_string: str, *, login: bool = False, timeout: int = 120,
-                      stdin_data: Optional[str] = None) -> subprocess.Popen:
-            # Hermes 0.23.3 LocalEnvironment._run_bash (tools/environments/local.py:1229-1288), unchanged except the
-            # one marked line: the process started is sandbox-exec, which starts bash under this session's profile.
-            bash = L._find_bash()
-            run_env = L._make_run_env(self.env)
-            prefix = self._tether_prefix(run_env)                       # tether: before anything is opened
-            handoff = getattr(self, "_secret_handoff", None)
-            session_id = getattr(self, "_session_id", "")
-            token = L._secret_fd_token(session_id)
-            secret_fd, source_fd, restore_fd, secret_reader = -1, -1, -1, None
-            if handoff is not None and token in cmd_string:
-                if not login:
-                    source_fd, restore_fd = handoff.open_source(
-                        self._shell_state_paths(), skip=self._snapshot_excluded_passthrough_names())
-                    cmd_string = (cmd_string.replace(L._secret_src_token(session_id), str(source_fd))
-                                  .replace(L._secret_restore_token(session_id), str(restore_fd)))
-                generation = handoff.new_generation()
-                secret_fd, secret_reader = handoff.start_reader(self._snapshot_write_path(login), generation)
-                cmd_string = cmd_string.replace(token, str(secret_fd)).replace(L._secret_gen_token(session_id),
-                                                                               generation)
-            if login:
-                cmd_string = L._append_dropped_path_entries(cmd_string, run_env.get("PATH", ""))
-                cmd_string = L._prepend_shell_init(cmd_string, L._resolve_shell_init_files())
-            args = [*prefix, bash, *(["-l"] if login else []), "-c", cmd_string]    # tether: the one changed line
-            try:
-                proc = subprocess.Popen(
-                    args, text=True, env=run_env, encoding="utf-8", errors="replace",
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
-                    start_new_session=True, cwd=self._spawn_cwd(),
-                    pass_fds=tuple(fd for fd in (secret_fd, source_fd, restore_fd) if fd >= 0))
-            finally:
-                for fd in (secret_fd, source_fd, restore_fd):
-                    if fd >= 0:
-                        os.close(fd)
-            proc._hermes_secret_reader = secret_reader
-            L.own_process_groups([proc.pid])
-            proc._hermes_owned_pgid = proc._hermes_pgid = proc.pid
-            from gateway.status import get_process_start_time
-            proc._hermes_pgid_start = get_process_start_time(proc.pid)
-            if stdin_data is not None:
-                L._pipe_stdin(proc, stdin_data)
-            return proc
-
-        def _spawn_long_lived(self, argv: list[str], child_env: Optional[dict]) -> subprocess.Popen:
-            prefix = self._tether_prefix(L._make_run_env({**self.env, **(child_env or {})}))
-            return super()._spawn_long_lived([*prefix, *argv], child_env)
 
     return LockedEnvironment
 
@@ -604,6 +600,10 @@ def path_refusal(path: str, *, write: bool, base: Optional[str], workspace: Opti
     return None
 
 
+UNCHECKABLE = ("tether: this file tool's arguments are not in a form this device can check (a path must be text), so "
+               "it was refused. Send the path as text.")
+
+
 def tool_refusal(name: str, args: dict, *, base: Optional[str], workspace: Optional[str]) -> Optional[str]:
     """The check every lent file tool passes before Hermes runs it here (D76)."""
     prot = protected_set()
@@ -611,6 +611,10 @@ def tool_refusal(name: str, args: dict, *, base: Optional[str], workspace: Optio
     if leak:
         return LINKED.format(path=leak)
     path = args.get("path")
+    # A value this check cannot read is refused, never passed through (gauntlet 3.1 F3).
+    if (path is not None and not isinstance(path, str)) or (name == "patch" and args.get("patch") is not None
+                                                            and not isinstance(args.get("patch"), str)):
+        return UNCHECKABLE
     if name == "read_file":
         return path_refusal(str(path or ""), write=False, base=base, workspace=workspace, prot=prot)
     if name == "write_file":

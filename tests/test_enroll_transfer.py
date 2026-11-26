@@ -22,7 +22,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugin" / "tether"))
-sys.path.insert(1, str(Path.home() / ".hermes" / "hermes-agent"))
+sys.path.insert(1, str(Path(os.environ.get("HERMES_AGENT_SRC") or Path.home() / ".hermes" / "hermes-agent")))
 
 from test_enroll import Clock, Person, recovery_in, run, seal, seed_in  # noqa: E402
 from test_link_loopback import isolate_session, temp_dir  # noqa: E402

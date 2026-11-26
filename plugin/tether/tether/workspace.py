@@ -307,12 +307,59 @@ class _PathCleanup:
         except FileNotFoundError:
             return
         except PermissionError:
-            # Windows will not delete a read-only file. That mark is cleared only on a plain file with no other name
-            # (a hard link shares it with the person's own file), never on a link or junction.
-            if _is_link(st) or not stat.S_ISREG(st.st_mode) or st.st_nlink > 1 or st.st_mode & stat.S_IWRITE:
+            # Windows will not delete a read-only file. That mark is cleared only on a plain file with no other name,
+            # never on a link or junction. A hard link shares the mark with the person's own file (git's objects after
+            # a local clone): only this name is removed, with the mark left as it is.
+            if _is_link(st) or not stat.S_ISREG(st.st_mode) or st.st_mode & stat.S_IWRITE:
                 raise
+            if st.st_nlink > 1:
+                _delete_name_keeping_mark(path, st)
+                return
             os.chmod(path, stat.S_IWRITE)
         remove(path)
+
+
+def _delete_name_keeping_mark(path: str, st: os.stat_result) -> None:
+    """Windows: remove one name of a read-only file without touching its read-only mark (FileDispositionInfoEx with
+    IGNORE_READONLY_ATTRIBUTE, Windows 10 1809 and later). The name is opened itself (never through a reparse point)
+    and must still be the file that was looked at; anything else raises and the entry stays for the sweeper."""
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateFileW.restype = wintypes.HANDLE
+    k32.CreateFileW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD,
+                                wintypes.DWORD, wintypes.HANDLE)
+    k32.SetFileInformationByHandle.restype = wintypes.BOOL
+    k32.SetFileInformationByHandle.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
+    k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+
+    delete, read_attributes, share_all, open_existing, open_reparse_point = 0x10000, 0x80, 0x7, 3, 0x200000
+    handle = k32.CreateFileW(path, delete | read_attributes, share_all, None, open_existing, open_reparse_point, None)
+    if handle is None or handle == wintypes.HANDLE(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        fd = msvcrt.open_osfhandle(handle, os.O_RDONLY)
+    except Exception:
+        k32.CloseHandle(handle)
+        raise
+    try:
+        now = os.fstat(fd)
+        if not os.path.samestat(now, st) or not stat.S_ISREG(now.st_mode):
+            raise PermissionError(f"{path!r} changed before it could be removed")
+
+        class _DispositionEx(ctypes.Structure):
+            _fields_ = [("Flags", wintypes.ULONG)]
+
+        file_disposition_info_ex = 21
+        flags = 0x1 | 0x2 | 0x10        # DELETE | POSIX_SEMANTICS | IGNORE_READONLY_ATTRIBUTE
+        info = _DispositionEx(flags)
+        if not k32.SetFileInformationByHandle(handle, file_disposition_info_ex, ctypes.byref(info),
+                                              ctypes.sizeof(info)):
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        os.close(fd)
 
 
 def _read_only(dir_fd: int, dev: int) -> None:

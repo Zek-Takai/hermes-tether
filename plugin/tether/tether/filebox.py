@@ -11,10 +11,10 @@ and friendlier refusal; they are no longer what protects the files.
 
 Everything else about a call stays in this process, as before: Hermes's request middleware, its pre_tool_call hooks
 (block, approve, modify), its edit approval, its execution middleware, its post-call hooks. Only the tool body moves:
-Hermes's registry.dispatch is wrapped once (install) and, for a call whose task id is one of Tether's remote sessions
-("tether-<session>"), hands the call to that session's helper. Where no helper serves the call, it is refused; it
-never falls back to this process (fail closed). The device's own agent never uses a "tether-" task id and is not
-affected. Windows and allow_unlocked_commands keep the earlier behaviour: the tools run in this process, behind the
+tether's tool_execution middleware (lent_call), for a call whose task id is one of Tether's remote sessions
+(``plugin:<plugin id>:<key>``, from ctx.run_tool_call), asks Hermes to authorize it (authorize_tool_call) and hands
+it to that session's helper instead of next_call. Where no helper serves the call, it is refused; it never falls back
+to this process (fail closed). The device's own agent never uses the plugin's task ids and is not affected. Windows and allow_unlocked_commands keep the earlier behaviour: the tools run in this process, behind the
 path checks only (no lock there; see lock.files_boxed).
 
 The helper holds Hermes's per-task file state (what was read, patch failures) for the life of the session, as this
@@ -43,14 +43,11 @@ from typing import Any, Callable, Iterator, Optional
 logger = logging.getLogger(__name__)
 
 LENT = frozenset({"read_file", "write_file", "patch", "search_files"})
-TASK_PREFIX = "tether-"                 # ToolRunner's task id for a remote session's file tool: "tether-<session>"
 START_TIMEOUT_S = 60.0                  # the helper's start (Python and Hermes's file tools imported)
-# Hermes names the helper uses (inside its source string) and the dispatch install() wraps, with its one caller:
-# listed for the maintainers' watcher (scripts/hermes_watch.py).
-_HERMES_NAMES = (("tools.registry", "registry"), ("tools.file_tools", "read_file_tool"),
-                 ("tools.file_tools", "write_file_tool"), ("tools.file_tools", "patch_tool"),
-                 ("tools.file_tools", "search_tool"), ("tools.terminal_tool", "_active_environments"),
-                 ("model_tools", "_execute_tool"))
+# Hermes names the helper uses (inside its source string) and lent_call's authorization: listed for the
+# maintainers' watcher (scripts/hermes_watch.py).
+_HERMES_NAMES = (("tools.registry", "registry"), ("tools.registry", "discover_builtin_tools"),
+                 ("hermes_cli.middleware", "authorize_tool_call"))
 
 NO_BOX = ("tether: this file tool was not run: this device's session lock could not start for file tools ({why}). "
           "A remote session's file tools run only inside it; the person at the machine can see the reason in "
@@ -66,9 +63,8 @@ os.dup2(2, 1)
 sys.stdout = sys.stderr
 sys.path[:0] = [p for p in [sys.argv[1], *(json.loads(sys.argv[2]) if len(sys.argv) > 2 else [])] if p not in sys.path]
 try:
-    import tools.file_tools
-    import tools.terminal_tool as T
-    from tools.registry import registry
+    from tools.registry import discover_builtin_tools, registry
+    discover_builtin_tools()
 except BaseException as e:
     out.write(json.dumps({"ready": False, "error": type(e).__name__ + ": " + str(e)[:200]}) + "\n")
     out.flush()
@@ -81,12 +77,7 @@ for line in sys.stdin:
         cwd = req.get("cwd") or ""
         if cwd and os.path.isdir(cwd):
             os.chdir(cwd)
-            os.environ["TERMINAL_CWD"] = cwd
-            for env in list(getattr(T, "_active_environments", {}).values()):
-                try:
-                    env.cwd = cwd
-                except Exception:
-                    pass
+            os.environ["TERMINAL_CWD"] = cwd      # Hermes anchors a relative path at the configured terminal folder
         res = registry.dispatch(req["name"], req["args"], task_id=req["task_id"],
                                 session_id=req.get("session_id") or req["task_id"])
         reply = {"ok": True, "result": res}
@@ -258,15 +249,14 @@ class FileBox:
             self._kill()
 
 
-# ---------- Hermes's registry: the one place a lent tool's body runs ----------
+# ---------- the one place a lent tool's body runs: tether's tool_execution middleware ----------
 _serving: dict[str, list] = {}          # task id -> [box, number of calls in flight]
 _serving_lock = threading.Lock()
-_install_lock = threading.Lock()
 
 
 @contextlib.contextmanager
 def serving(task_id: str, box: Optional[FileBox]) -> Iterator[None]:
-    """While a call of ``task_id`` is in flight, its registry dispatch is run by ``box`` (None: nothing to serve)."""
+    """While a call of ``task_id`` is in flight, its tool body is run by ``box`` (None: nothing to serve)."""
     if box is None:
         yield
         return
@@ -289,53 +279,39 @@ def _error(text: str) -> str:
     return json.dumps({"error": text})
 
 
-def _route(original: Callable[..., Any], name: Any, args: Any, a: tuple, kw: dict) -> Any:
-    task = str(kw.get("task_id") or "")
-    if name not in LENT or not task.startswith(TASK_PREFIX):
-        return original(name, args, *a, **kw)
+def _ours(task: str) -> bool:
+    """A task id of this plugin's own run_tool_call tasks: plugin:<plugin id>:<key>."""
+    from .device_exec import _plugin_ctx
+    plugin_id = str(getattr(_plugin_ctx(), "plugin_id", "") or "tether")
+    return task.startswith(f"plugin:{plugin_id}:")
+
+
+def lent_call(kwargs: dict[str, Any]) -> Optional[Any]:
+    """tool_execution middleware, device side (D79): the result of a remote session's lent file tool run in its
+    locked helper, or None when this call is not one (it then goes on as usual). Hermes's own checks of the call
+    run first (authorize_tool_call: in handle_function_call they ran before the middleware, and Hermes returns that
+    decision); a refusal is returned as Hermes reported it. Without a helper the call is refused."""
+    name, task = kwargs.get("tool_name"), str(kwargs.get("task_id") or "")
+    if name not in LENT or not _ours(task):
+        return None
     from .lock import files_boxed
     if not files_boxed():
-        return original(name, args, *a, **kw)        # Windows, allow_unlocked_commands: this process, as before
+        return None                                  # Windows, allow_unlocked_commands: this process, as before
     with _serving_lock:
         entry = _serving.get(task)
     if entry is None:
         logger.warning("tether: a remote session's file tool reached Hermes with no locked helper; refused")
         return _error(NO_BOX.format(why="no locked helper serves this call"))
+    from hermes_cli.middleware import authorize_tool_call
+    decision = authorize_tool_call(kwargs.get("args") or {})
+    if not decision.allowed:
+        return decision.result
     from .device_exec import _stop_pending
     from .lock import LockError
     try:
-        return entry[0].call(str(name), dict(args or {}), task_id=task, session_id=kw.get("session_id"),
+        return entry[0].call(str(name), dict(decision.args or {}), task_id=task, session_id=kwargs.get("session_id"),
                              stopped=_stop_pending)
     except LockError as e:
         return _error(str(e))
-
-
-def install() -> None:
-    """Wraps Hermes's registry.dispatch once (idempotent). Raises LockError when it cannot be wrapped."""
-    with _install_lock:
-        try:
-            from tools.registry import ToolRegistry, registry
-        except Exception as e:  # noqa: BLE001
-            raise _lock_error(f"Hermes's tool registry is not importable ({type(e).__name__})") from None
-        current = registry.dispatch
-        if getattr(current, "_tether_files_boxed", False):
-            return
-        if getattr(current, "__func__", None) is not ToolRegistry.dispatch:
-            logger.warning("tether: Hermes's tool dispatch was already replaced by something else; it is wrapped as is")
-
-        def dispatch(name: Any, args: Any, *a: Any, **kw: Any) -> Any:
-            return _route(current, name, args, a, kw)
-
-        dispatch._tether_files_boxed = True           # type: ignore[attr-defined]
-        dispatch.__wrapped__ = current                # type: ignore[attr-defined]
-        registry.dispatch = dispatch
-        if not getattr(registry.dispatch, "_tether_files_boxed", False):
-            raise _lock_error("Hermes's tool registry could not be wrapped")
-
-
-def installed() -> bool:
-    try:
-        from tools.registry import registry
-    except Exception:  # noqa: BLE001
-        return False
-    return bool(getattr(registry.dispatch, "_tether_files_boxed", False))
+    except InterruptedError:
+        return _error("tether: this file tool was stopped before it finished")

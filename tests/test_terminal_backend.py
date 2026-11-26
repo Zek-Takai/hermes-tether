@@ -5,7 +5,9 @@ Needs Hermes itself importable (run with Hermes's Python; the test adds its sour
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import os
+import shlex
 import tempfile
 import sys
 import threading
@@ -13,7 +15,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-HERMES_SRC = Path.home() / ".hermes" / "hermes-agent"
+HERMES_SRC = Path(os.environ.get("HERMES_AGENT_SRC") or Path.home() / ".hermes" / "hermes-agent")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugin" / "tether"))
 sys.path.insert(1, str(HERMES_SRC))
 
@@ -145,8 +147,6 @@ class TerminalBackendTests(unittest.TestCase):
     def test_host_only_work_skips_the_lost_device_and_gate_checks(self):
         """Host-owned file work is not a command meant for a device: a session whose device connection is gone, and
         a gate note for a command that never ran, must not turn it into a refusal."""
-        import time
-        from tether import provider
         from tether.provider import host_only
         self.rt.targets["default"] = "mac"
         self.rt.turn_open["default"] = True
@@ -160,8 +160,8 @@ class TerminalBackendTests(unittest.TestCase):
                 r_lost = env.execute("echo here")
                 self.rt.working_on.clear()
                 self.rt.held.clear()
-                provider._guard.note = ("echo here", time.monotonic())
-                r_gated = env.execute("echo here")
+                with self._gate_approved("echo here"):
+                    r_gated = env.execute("echo here")
         self.assertEqual(local.call_count, 2)
         self.assertFalse("no longer open" in r_lost["output"], "a lost-device refusal reached host-owned work")
         self.assertFalse("did not run anywhere" in r_gated["output"], "a gate refusal reached host-owned work")
@@ -204,15 +204,18 @@ class TerminalBackendTests(unittest.TestCase):
             sent.append(kind)
             return {"returncode": 0}, b""
 
+        from tools.environments.command_context import command_context
         with mock.patch.object(env, "_run_local", return_value=host) as local, \
                 mock.patch.object(self.rt, "call_target", side_effect=spy):
-            self.assertEqual(env.execute(f"test -r {spill}")["returncode"], 0)
-            self.assertEqual(local.call_count, 1)
-            self.assertEqual(sent, [])
-            # another path, or the probe text with more in it: an ordinary command, sent to the device
-            env.execute("test -r /etc/hosts")
-            env.execute(f"test -r {spill} && rm -rf /tmp/x")
-            self.assertEqual(sent, ["exec", "exec"])
+            with command_context("spill"):                                   # Hermes's own probe
+                self.assertEqual(env.execute(f"test -r {spill}")["returncode"], 0)
+                self.assertEqual(local.call_count, 1)
+                self.assertEqual(sent, [])
+                # another path, or the probe text with more in it: an ordinary command, sent to the device
+                env.execute("test -r /etc/hosts")
+                env.execute(f"test -r {spill} && rm -rf /tmp/x")
+            env.execute(f"test -r {spill}")              # the same text typed by the model: the device's
+            self.assertEqual(sent, ["exec", "exec", "exec"])
             self.assertEqual(local.call_count, 1)
 
     def test_a_large_host_result_is_not_copied_to_the_device_when_the_host_spill_fails(self):
@@ -309,51 +312,134 @@ class TerminalBackendTests(unittest.TestCase):
     # a command the rules flag.
     def _flagging(self, mode="manual"):
         findings = lambda c: [("tether_test", "test flag")] if "FLAGGED" in c else []  # noqa: E731
-        return (mock.patch("tools.approval._command_findings", findings),
-                mock.patch("tools.approval_context._get_approval_mode", lambda: mode),
-                mock.patch("tools.approval._command_matches_permanent_allowlist", lambda c: False),
-                mock.patch("tools.approval._is_permanently_approved", lambda k: False))
+        # The host's gate reads these from tools.approval; the device's judge_command from tools.approval_judge.
+        stack = contextlib.ExitStack()
+        for module in ("tools.approval", "tools.approval_judge"):
+            stack.enter_context(mock.patch(f"{module}._command_findings", findings))
+            stack.enter_context(mock.patch(f"{module}._command_matches_permanent_allowlist", lambda c: False))
+            stack.enter_context(mock.patch(f"{module}._is_permanently_approved", lambda k: False))
+        return (stack, mock.patch("tools.approval_context._get_approval_mode", lambda: mode),
+                contextlib.nullcontext(), contextlib.nullcontext())
 
     def _on_device(self):
         self.rt.targets["default"] = "mac"
         self.rt.turn_open["default"] = True
 
     @staticmethod
-    def _hermes_command_gate_reads(provider, command="echo FLAGGED"):
-        def check_all_command_guards(command, env_type="tether"):   # named like Hermes's gate (provider reads it)
-            return provider.skip_container_guards
-        return check_all_command_guards(command)
+    def _gate_approved(command, kind="user"):
+        """Hermes's terminal tool stamp for a command its command gate approved (tools/terminal_tool.py)."""
+        from tools.environments.command_context import CommandApproval, command_context
+        return command_context("terminal", approval=CommandApproval(command, kind))
+
+    def test_execute_code_is_refused_on_a_hermes_without_the_kernel_opt_out(self):
+        """Gauntlet 3.1 F1: a Hermes that does not read supports_session_kernel would start its persistent kernel on
+        the device and later stop it by pid wherever the route is then. execute_code traffic is refused there."""
+        from tools.environments.command_context import command_context
+        from tether import provider
+        self.assertTrue(provider._kernel_opt_out_honoured())             # this Hermes reads it
+        self._on_device()
+        env = self.env()
+        with mock.patch.object(provider, "_kernel_opt_out_honoured", lambda: False), \
+                mock.patch.object(self.rt, "call_target", side_effect=AssertionError("sent to the device")), \
+                mock.patch.object(env, "_run_local", side_effect=AssertionError("ran on the host")):
+            for origin in ("execute_code", "execute_code_rpc"):
+                with command_context(origin):
+                    r = env.execute("mkdir -p /tmp/hermes_rkernel_0123456789ab")
+                self.assertEqual(r["returncode"], 1)
+                self.assertIn("supports_session_kernel", r["output"])
+
+    def test_a_job_stamp_counts_only_for_the_exact_text_hermes_sent(self):
+        """Gauntlet 3.1 host F2: the stamp alone (origin and job id) no longer makes any text a job's own. Hermes names
+        the exact command it sends in that block; anything else inside the block is refused, never run as a poll or a
+        stop (on the job's machine, unasked), and a stamp naming no text counts for nothing."""
+        from tools.environments.command_context import command_context
+        from tether.runtime import BgJob
+        job = BgJob(id="proc_0123456789ab", machine="local", session="default", log="/tmp/l", pid_path="/tmp/p",
+                    exit_path="/tmp/e", pid=424242)
+        self._on_device()
+        env = self.env()
+        with mock.patch.object(self.rt, "bg_jobs", {job.id: job}), \
+                mock.patch.object(env, "_run_local", return_value={"output": "ran", "returncode": 0}) as local:
+            for origin, named in (("background_poll", "cat /tmp/l"), ("background_poll", None),
+                                  ("background_kill", "kill 424242 2>/dev/null"), ("background_kill", None)):
+                with self.subTest(origin=origin, named=named):
+                    with command_context(origin, job_id=job.id, command=named):
+                        with self.assertRaises(RuntimeError):
+                            env.execute("echo NOT-HERMES > /tmp/x")
+            self.assertEqual(local.call_count, 0)
+            with command_context("background_poll", job_id=job.id, command="cat /tmp/l"):
+                self.assertEqual(env.execute("cat /tmp/l")["output"], "ran")     # the exact text: the job's machine
+            self.assertEqual(local.call_count, 1)
+
+    def test_other_sessions_jobs_never_push_out_a_running_device_job(self):
+        """Gauntlet 3.1 lock F1: finished host jobs from other sessions (cron, another chat) are dropped once their
+        process is gone, and at the cap host records go before any device job, so the user's device job keeps its
+        record and Hermes can still poll and stop it."""
+        from tether import runtime
+        from tether.runtime import BgJob
+        gone = 2 ** 22 + 12345                           # a pid no process has
+        mine = BgJob(id="proc_00000000mine", machine="mac", session="user-chat", log="l", pid_path="p",
+                     exit_path="e", pid=4242)
+        with mock.patch.object(runtime, "BG_JOBS_KEEP", 4), mock.patch.object(self.rt, "bg_jobs", {}):
+            self.rt.bg_start(mine)
+            for n in range(10):
+                self.rt.bg_start(BgJob(id=f"proc_cron{n:08d}", machine="local", session="cron-session", log="l",
+                                       pid_path="p", exit_path="e", pid=gone))
+            self.assertIn(mine.id, self.rt.bg_jobs)
+            self.assertLessEqual(len(self.rt.bg_jobs), 4)
+            for n in range(10):                          # running host jobs: the cap still keeps the device job
+                self.rt.bg_start(BgJob(id=f"proc_live{n:08d}", machine="local", session="cron-session", log="l",
+                                       pid_path="p", exit_path="e", pid=os.getpid()))
+            self.assertIn(mine.id, self.rt.bg_jobs)
+
+    def test_execute_code_cleanup_is_unasked_only_for_the_folder_hermes_named(self):
+        from tools.environments.command_context import command_context
+        from tether import provider
+        own, other = "rm -rf /tmp/hermes_exec_0123456789ab", "rm -rf /tmp/hermes_exec_ba9876543210"
+        with command_context("execute_code_rpc", command=own):
+            ctx = provider._command_context()
+            self.assertTrue(provider._per_call_cleanup(ctx, own))
+            self.assertFalse(provider._per_call_cleanup(ctx, other))
+        with command_context("execute_code_rpc"):
+            self.assertFalse(provider._per_call_cleanup(provider._command_context(), own))
 
     def test_hermes_gates_are_never_skipped(self):
-        from tether.provider import make_provider, _take_guard_handoff
+        from tether.provider import make_provider
         p = make_provider()
         self._on_device()
-        self.assertFalse(self._hermes_command_gate_reads(p))
-
-        def check_execute_code_guard():
-            return p.skip_container_guards
-        _take_guard_handoff("echo FLAGGED")
-        self.assertFalse(check_execute_code_guard())
-        self.assertFalse(_take_guard_handoff("echo FLAGGED"))   # the code gate does not stand in for the command gate
+        self.assertFalse(p.skip_container_guards)
         self.rt.targets["default"] = "local"
         self.assertFalse(p.skip_container_guards)
 
     def test_command_that_passed_the_hermes_gate_is_not_asked_again(self):
-        from tether.provider import make_provider
-        p = make_provider()
         self._on_device()
         never = mock.Mock(side_effect=AssertionError("asked twice"))
         a, b, c, d = self._flagging()
         with a, b, c, d, mock.patch("tools.approval.check_dangerous_command", never):
-            self._hermes_command_gate_reads(p)
-            r = self.env().execute("echo FLAGGED")
+            with self._gate_approved("echo FLAGGED"):
+                r = self.env().execute("echo FLAGGED")
         self.assertEqual((r["output"].strip(), r["returncode"]), ("FLAGGED", 0))
 
-    def test_gate_note_covers_only_the_command_it_checked(self):
-        """The note is made when the gate starts reading, before it decides: a gate that then denies or aborts
-        must not let a different command (e.g. one from an execute_code script) through as already approved."""
-        from tether.provider import make_provider
-        p = make_provider()
+    def test_a_stamp_nobody_judged_is_not_a_gate_approval(self):
+        """yolo / approvals off (bypass), no reviewer present (unattended), a forced call or a skipped gate: Hermes
+        stamps the command, but nobody judged it. The device judges it in full and the person here is asked."""
+        self._on_device()
+        for kind in ("bypass", "unattended", "forced", "gate_skipped"):
+            with self.subTest(kind):
+                asked = []
+
+                def gate(command, env_type, **kw):
+                    asked.append(command)
+                    return {"approved": True}
+                a, b, c, d = self._flagging()
+                with a, b, c, d, mock.patch("tools.approval.check_dangerous_command", gate):
+                    with self._gate_approved("echo FLAGGED", kind):
+                        r = self.env().execute("echo FLAGGED")
+                self.assertEqual((r["returncode"], asked), (0, ["echo FLAGGED"]))
+
+    def test_gate_approval_covers_only_the_command_it_checked(self):
+        """An approval stamp names the exact text the gate saw: a different command (e.g. one from an execute_code
+        script) is not let through as already approved."""
         self._on_device()
         asked = []
 
@@ -362,14 +448,13 @@ class TerminalBackendTests(unittest.TestCase):
             return {"approved": False, "message": "BLOCKED: denied"}
         a, b, c, d = self._flagging()
         with a, b, c, d, mock.patch("tools.approval.check_dangerous_command", gate):
-            self._hermes_command_gate_reads(p, "echo FLAGGED checked")     # the gate saw (and denied) this one
-            r = self.env().execute("echo FLAGGED other")                    # a different command arrives
+            with self._gate_approved("echo FLAGGED checked"):               # the gate approved this text...
+                r = self.env().execute("echo FLAGGED other")                # ...and a different command arrives
         self.assertEqual((r["output"], r["returncode"]), ("BLOCKED: denied", 1))
         self.assertEqual(asked, ["echo FLAGGED other"])                    # judged in full, the human asked
 
-    def test_gate_note_ends_with_the_tool_call(self):
-        from tether.provider import make_provider, clear_guard_handoff
-        p = make_provider()
+    def test_gate_approval_ends_with_its_call(self):
+        """The stamp lives for the call it was made for: the same text sent later, outside it, is judged in full."""
         self._on_device()
         asked = []
 
@@ -378,20 +463,18 @@ class TerminalBackendTests(unittest.TestCase):
             return {"approved": False, "message": "BLOCKED: denied"}
         a, b, c, d = self._flagging()
         with a, b, c, d, mock.patch("tools.approval.check_dangerous_command", gate):
-            self._hermes_command_gate_reads(p)                             # gate read, then denied: never ran
-            clear_guard_handoff(tool_name="terminal", args={}, result="")  # post_tool_call
+            with self._gate_approved("echo FLAGGED"):
+                pass                                                       # approved, but never sent
             r = self.env().execute("echo FLAGGED")                         # same text, later, un-checked
         self.assertEqual(r["returncode"], 1)
         self.assertEqual(asked, ["echo FLAGGED"])
 
     def test_device_floors_hold_even_after_the_hermes_gate(self):
-        from tether.provider import make_provider
-        p = make_provider()
         self._on_device()
         fake = lambda c: (c == "echo HARDLINE-TEST", "test pattern")  # noqa: E731
         with mock.patch("tools.approval.detect_hardline_command", fake):
-            self._hermes_command_gate_reads(p, "echo HARDLINE-TEST")
-            r = self.env().execute("echo HARDLINE-TEST")
+            with self._gate_approved("echo HARDLINE-TEST"):
+                r = self.env().execute("echo HARDLINE-TEST")
         self.assertEqual(r["returncode"], 1)
         self.assertNotIn("HARDLINE-TEST\n", r["output"])
 
@@ -429,13 +512,11 @@ class TerminalBackendTests(unittest.TestCase):
             self.assertEqual(self.env().execute("echo clean")["output"].strip(), "clean")
 
     def test_command_meant_for_the_device_never_runs_on_the_host(self):
-        from tether.provider import make_provider
-        p = make_provider()
         self._on_device()
         marker = temp_dir(self, "hp-d25-") / "ran"
-        self._hermes_command_gate_reads(p, f"touch {marker}")   # gated while the mac was the target
-        self.rt.targets["default"] = "local"            # ...then the connection closed before it ran
-        r = self.env().execute(f"touch {marker}")
+        with self._gate_approved(f"touch {marker}"):     # gated while the mac was the target
+            self.rt.targets["default"] = "local"        # ...then the connection closed before it ran
+            r = self.env().execute(f"touch {marker}")
         self.assertEqual(r["returncode"], 1)
         self.assertIn("did not run anywhere", r["output"])
         self.assertFalse(marker.exists())
@@ -602,12 +683,16 @@ class TerminalBackendTests(unittest.TestCase):
     # ---------- background jobs (terminal background=true): polls and stops go to the job's own machine ----------
     # Every job here is started, polled and stopped by Hermes's own registry (spawn_via_env, its poller thread,
     # kill_process), never by calling env.execute with Hermes's text: only Hermes's own calls are the job's (D38).
-    def _spawn(self, command, env=None, task="t1"):
-        """Hermes's own registry starts the command through the tether environment (spawn_via_env). When the test
-        ends, the job's whole process group stops (the device is this machine) and its three files go (F79)."""
+    def _spawn(self, command, env=None, task="t1", approved=None):
+        """Hermes's own registry starts the command through the tether environment (spawn_via_env). ``approved``:
+        True when Hermes's gate approved this command, or the text it approved instead. When the test ends, the
+        job's whole process group stops (the device is this machine) and its three files go (F79)."""
+        from tools.environments.command_context import CommandApproval
         from tools.process_registry import process_registry
         from tether.device_exec import job_group_of
-        session = process_registry.spawn_via_env(env=env or self.env(), command=command, task_id=task, timeout=30)
+        approval = None if approved is None else CommandApproval(command if approved is True else approved, "user")
+        session = process_registry.spawn_via_env(env=env or self.env(), command=command, task_id=task, timeout=30,
+                                                 approval=approval)
         self.addCleanup(self._end_job, session, job_group_of(session.pid))
         return session
 
@@ -791,16 +876,16 @@ class TerminalBackendTests(unittest.TestCase):
             env.execute(typed)
         self.assertEqual(device.call_args.args[1]["command"], typed)
 
-    def test_records_go_once_hermes_stops_tracking_the_job(self):
-        """F44: a job's record lives while Hermes tracks the job, not for the life of the process."""
-        self.rt.targets["default"] = "local"
-        self.rt.turn_open["default"] = True
-        env = self.env()
-        first = self._spawn("true", env)
-        self.assertTrue(self._wait_exited(first))
-        second = self._spawn("sleep 30", env)
-        self.assertNotIn(first.id, self.rt.bg_jobs, "an ended job's record was kept")
-        self.assertIn(second.id, self.rt.bg_jobs)
+    def test_job_records_are_capped(self):
+        """F44: job records do not grow for the life of the process: past BG_JOBS_KEEP the oldest goes."""
+        from tether import runtime
+        from tether.runtime import BgJob
+        with mock.patch.object(runtime, "BG_JOBS_KEEP", 2), mock.patch.object(self.rt, "bg_jobs", {}):
+            for n in range(3):
+                jid = f"proc_00000000000{n}"
+                self.rt.bg_start(BgJob(id=jid, machine="local", session="default", log="l", pid_path="p",
+                                       exit_path="e", pid=1))
+            self.assertEqual(list(self.rt.bg_jobs), ["proc_000000000001", "proc_000000000002"])
 
     def test_a_wrapper_typed_as_an_ordinary_command_records_no_job(self):
         """F44: the model types Hermes's exact background wrapper as a foreground command. It runs as typed (here on
@@ -902,13 +987,19 @@ class TerminalBackendTests(unittest.TestCase):
     def test_hermes_status_reads_for_a_device_job_go_to_its_machine(self):
         """A poll reply Hermes cannot read makes its poller send its two status reads (fallback_exit_code, with cwd
         and a timeout). After the turn ended they go to the job's device, never to the host."""
-        from tether.provider import _probe_texts
+        from tools.process_registry_env_log import fallback_exit_code
         self._on_device()
         env = self.env()
         with self._approve_device_rules():
             session = self._spawn("sleep 30", env)
         job = self._job(session)
-        probes = _probe_texts(job)
+        probes = []
+
+        class Recorder:                                  # Hermes's two status reads, as its own function sends them
+            def execute(self, command, *a, **k):
+                probes.append(command)
+                return {"output": "1" if len(probes) == 1 else "0"}
+        fallback_exit_code(Recorder(), shlex.quote(job.pid_path), shlex.quote(job.exit_path))
         sent = []
 
         def device(j, command, timeout, stop=False):
@@ -974,21 +1065,16 @@ class TerminalBackendTests(unittest.TestCase):
     def test_a_background_command_the_gate_checked_is_not_asked_again(self):
         """F47 (D25): Hermes's gate checked the model's command, then spawn_via_env sends its own wrapper ('nohup
         bash -lc ...'), which the device's full rules would flag. Nobody is asked a second time."""
-        from tether.provider import make_provider
-        p = make_provider()
         self._on_device()
         never = mock.Mock(side_effect=AssertionError("asked again, for Hermes's own wrapper"))
         with mock.patch("tools.approval.check_dangerous_command", never):
-            self._hermes_command_gate_reads(p, "echo bg-job")
-            session = self._spawn("echo bg-job", self.env())
+            session = self._spawn("echo bg-job", self.env(), approved=True)
             self.assertTrue(self._wait_exited(session))
         never.assert_not_called()
         self.assertIn("bg-job", session.output_buffer)
 
     def test_the_wrapper_of_a_command_the_gate_did_not_check_is_judged_in_full(self):
         """Guard for F47: the note covers only the wrapper of the very command the gate checked."""
-        from tether.provider import make_provider
-        p = make_provider()
         self._on_device()
         asked = []
 
@@ -996,9 +1082,8 @@ class TerminalBackendTests(unittest.TestCase):
             asked.append(command)
             return {"approved": False, "message": "BLOCKED: denied"}
         with mock.patch("tools.approval.check_dangerous_command", gate):
-            self._hermes_command_gate_reads(p, "echo checked")
             with self.assertRaises(RuntimeError):        # Hermes: the wrapper printed no pid, nothing started
-                self._spawn("echo other", self.env())
+                self._spawn("echo other", self.env(), approved="echo checked")
         self.assertEqual(len(asked), 1)
         self.assertIn("nohup bash -lc 'echo other'", asked[0])
 

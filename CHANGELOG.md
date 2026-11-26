@@ -1,6 +1,55 @@
 # Changelog
 
-## 0.3.0 (unreleased): approval with a code from your phone, and the session lock
+## 0.3.1 (2026-11-25): Hermes's public plugin seams only
+
+Same behaviour as 0.3.0; only how Tether talks to Hermes changed. Every Hermes name Tether uses is on Hermes's
+public plugin list (`hermes plugins validate` reports no private import). Needs a Hermes that has the public seams
+it uses ([NousResearch/hermes-agent#160267](https://github.com/NousResearch/hermes-agent/pull/160267), [#160268](https://github.com/NousResearch/hermes-agent/pull/160268), [#160269](https://github.com/NousResearch/hermes-agent/pull/160269)); on an older one each protection fails closed (the call or command is refused) and the log says which seam
+is missing.
+
+### Changed
+
+- **Hermes's checks of a file call sent to a device** run through Hermes's `authorize_tool_call` instead of Tether
+  calling Hermes's internal hook runner, guard constants and guardrails after finding its caller on the call stack.
+  Hermes applies `post_tool_call` and `transform_tool_result` to the device's result itself.
+- **The terminal backend tells Hermes's own commands from the model's** by Hermes's command context (background
+  jobs, result spills, media reads, execute_code traffic) instead of reading the call stack. A background job's
+  poll, status read or stop, and execute_code's cleanup, count as Hermes's own only when the stamp names that exact
+  text (as 0.3.0 required by matching Hermes's command text itself).
+- **A command counts as approved by Hermes's command gate only when a person or Hermes's rules judged it.** With
+  yolo or approvals off, no reviewer present, a forced call or a skipped gate, the device now judges the command
+  with its own full rules (its floors, its deny rules, its approvals), and a command they flag is put to the person
+  in the session.
+- **A device judges commands with Hermes's `judge_command`.** This also closes two gaps of 0.3.0's own judge: with
+  approvals off, a command Hermes's hardline scan cannot read to the end is refused; and a rule check that fails
+  refuses the command instead of falling back to the pattern layer.
+- **execute_code over Tether** declares that it keeps no persistent kernel (`supports_session_kernel = False`)
+  instead of refusing the kernel's commands; scripts still run as one command each. On a Hermes that does not read
+  that attribute, execute_code is refused over Tether.
+- **Lent file tools on a device** run through `ctx.run_tool_call` under the plugin's own task; on a locked Mac the
+  tool body goes to the session's locked helper from Tether's middleware after Hermes authorizes the call, instead
+  of Tether wrapping Hermes's tool registry. Stops use Hermes's `InterruptScope`; session teardown uses
+  `ctx.release_tool_task`.
+- **The session lock** subclasses `LocalEnvironment` through its `wrap_argv` hook instead of carrying a copy of
+  Hermes's `_run_bash`.
+- **The key passphrase** is masked through `register_plugin_redaction_value` (its own bucket; it cannot push out
+  vault values).
+- Background-job records are kept up to a fixed cap instead of until Hermes's own record of the job is gone.
+
+### Fixed on Windows devices (checked on a real Windows machine)
+
+- **A session's folder is removed after a local `git clone` in it.** Git's objects are read-only hard links to the
+  person's repo; Tether never clears that shared mark, so Windows refused the delete and the folder stayed for good.
+  Only the session's name for the file is now removed, with the read-only mark left as it is.
+- **execute_code works on a Windows device.** Hermes runs `python3`, which on most Windows machines is only the
+  Microsoft Store's alias. When that is all there is, the session's terminal gets a `python3` in the session's own
+  folder that runs the device's Hermes Python; it goes with the folder.
+- **Checking whether a Hermes process is alive never ends it on Windows** (`os.kill(pid, 0)` terminates a process
+  there); it only asks. Host side only today.
+- Tests: folders with read-only files, and two tests' temp folders, are removed after the run; Windows-specific
+  expectations for the lock file and file modes.
+
+## 0.3.0 (2026-11-22): approval with a code from your phone, and the session lock
 
 ### Update notes
 

@@ -10,6 +10,7 @@ Command output travels in the frame body (it can be far larger than a header).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -32,14 +33,36 @@ NO_TREE_STOP = ("tether cannot stop a background job's whole process tree on Win
                 "stop it at the machine, or with a command of your own")
 
 
-def _set_stop(tid: int | None, active: bool) -> None:
-    """Sets or clears Hermes's interrupt bit for one worker thread (its terminal wait kills the command when set).
-    Without Hermes importable there is nothing to stop, so this does nothing; it never raises."""
+NO_STOP = ("tether: this device's Hermes has no stop handle for remote work (tools.interrupt.InterruptScope), so a "
+           "stop from the host could not end it; nothing was run. Update Hermes on this device.")
+
+
+def _interrupt_scope() -> Any:
+    """Hermes's public stop handle for this worker thread (tools.interrupt.InterruptScope): it reaches only the
+    thread that enters it, only while it is open, and its terminal wait kills the command when set. Without it a stop
+    could not reach the work, so the work is refused (gauntlet 3.1 F1)."""
     try:
-        from tools.interrupt import set_interrupt
-        set_interrupt(active, tid)
-    except Exception:  # noqa: BLE001 - the stop signal must never fail a command
-        pass
+        from tools.interrupt import InterruptScope
+    except Exception:  # noqa: BLE001
+        raise PermissionError(NO_STOP) from None
+    return InterruptScope()
+
+
+def set_plugin_context(ctx: Any) -> None:
+    """The plugin's PluginContext, kept on the shared handle (register sets it): lent file tools run through it."""
+    from .runtime import _handle
+    _handle().plugin_ctx = ctx
+
+
+def _plugin_ctx() -> Any:
+    from .runtime import _handle
+    return getattr(_handle(), "plugin_ctx", None)
+
+
+def task_key(session: str) -> str:
+    """The key of a host session's file-tool task here: Hermes keeps that task's file state under
+    ``plugin:<plugin id>:<key>`` (ctx.run_tool_call). Hashed, as a session id may hold any character."""
+    return hashlib.sha256(session.encode("utf-8", "surrogatepass")).hexdigest()[:32]
 
 
 def _stop_pending() -> bool:
@@ -57,14 +80,14 @@ class _Stop:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.cancelled = False
-        self.tid: int | None = None
+        self.scope: Any = None
         self.done = False
 
     def request(self) -> None:
         with self.lock:
             self.cancelled = True
-            if self.tid is not None and not self.done:
-                _set_stop(self.tid, True)
+            if self.scope is not None and not self.done:
+                self.scope.interrupt()
 
 
 class _Stops:
@@ -95,17 +118,17 @@ class _Stops:
 
 
 def _stoppable_worker(stop: _Stop, fn: Any, args: tuple) -> Any:
-    tid = threading.get_ident()
-    with stop.lock:
-        if stop.cancelled:                    # stopped before this thread got to it: do not run at all
-            raise InterruptedError("stopped before it started")
-        stop.tid = tid
-    try:
-        return fn(*args)
-    finally:
+    # The scope clears the stop it set when it closes: executor threads are reused, the bit must not outlive this call.
+    with _interrupt_scope() as scope:
         with stop.lock:
-            stop.done = True
-            _set_stop(tid, False)             # executor threads are reused: the bit must not outlive this call
+            if stop.cancelled:                # stopped before this thread got to it: do not run at all
+                raise InterruptedError("stopped before it started")
+            stop.scope = scope
+        try:
+            return fn(*args)
+        finally:
+            with stop.lock:
+                stop.done = True
 
 
 async def _run_stoppable(fn: Any, *args: Any, stops: _Stops | None = None, stop: _Stop | None = None,
@@ -139,6 +162,55 @@ def _bg_dir() -> str:
         import tempfile
         return tempfile.gettempdir()
     return BG_TEMP
+
+
+SHIM_DIR = ".tether-bin"
+
+
+def _python3_shim(start: Path) -> dict:
+    """Windows: Hermes's remote execute_code runs ``python3``, which on most Windows machines is only the Microsoft
+    Store's alias (python.org installs and venvs ship python.exe). When ``python3`` on this device's PATH is missing or
+    that alias, the session terminal gets a ``python3`` in the session's own workspace that runs this device's Hermes
+    Python (the interpreter Hermes's local execute_code uses), first on its PATH. It goes with the workspace. Elsewhere,
+    or with a real python3 present, nothing changes."""
+    if os.name != "nt":
+        return {}
+    import shutil
+    import sys
+    path = os.environ.get("PATH", "")
+    found = shutil.which("python3", path=path)
+    if found and ("\\windowsapps\\" not in found.lower() or _runs_python3(found)):
+        return {}                                         # a real python3 (the Python Install Manager lives in
+                                                          # WindowsApps too): left alone
+    exe = Path(sys.executable)
+    if exe.name.lower() == "pythonw.exe" and exe.with_name("python.exe").is_file():
+        exe = exe.with_name("python.exe")
+    folder = start / SHIM_DIR
+    try:
+        if os.path.lexists(folder) and (os.path.islink(folder) or not folder.is_dir()):
+            return {}                                     # never written through a link or onto something else
+        folder.mkdir(exist_ok=True)
+        with open(folder / "python3", "w", newline="\n") as fh:
+            fh.write(f'#!/bin/sh\nexec "{exe.as_posix()}" "$@"\n')
+    except OSError:
+        logger.debug("tether: no python3 shim for this session", exc_info=True)
+        return {}
+    # Git Bash's login profile rebuilds PATH from an inherited ORIGINAL_PATH when one is set (a gateway started from
+    # another Git Bash): dropped (None), so the profile builds it from this PATH.
+    return {"PATH": str(folder) + os.pathsep + path, "ORIGINAL_PATH": None}
+
+
+def _runs_python3(exe: str) -> bool:
+    """Whether ``exe`` really runs Python 3. The Store's alias prints an install hint and fails (exit 9009); the
+    Python Install Manager's python3 runs. No window, 10 s at most; anything else counts as not running."""
+    import subprocess
+    try:
+        done = subprocess.run([exe, "-c", "import sys; print(sys.version_info[0])"], capture_output=True, text=True,
+                              timeout=10, stdin=subprocess.DEVNULL,
+                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return done.returncode == 0 and done.stdout.strip() == "3"
 
 
 def job_paths(job_id: str) -> tuple[str, str, str]:
@@ -515,7 +587,8 @@ class LocalExec:
                 # the lock cannot be applied it raises LockError and no terminal is made (D73).
                 # REMOTE_MARK: `hermes tether authenticator ...` and `join` refuse to run in it (D67; a mark, not a wall).
                 from .enroll import REMOTE_MARK
-                env = locked_environment(cwd=str(start), timeout=timeout, env={**blank_env(), REMOTE_MARK: "1"},
+                env = locked_environment(cwd=str(start), timeout=timeout,
+                                         env={**blank_env(), REMOTE_MARK: "1", **_python3_shim(start)},
                                          workspace=str(start))
                 try:
                     env._tether_unlocked = mode
@@ -636,15 +709,16 @@ class LocalExec:
 
 
 def _release_file_tasks(session: str) -> None:
-    """Hermes keeps per-task file state for the file tools it runs for this session, under the task id
-    "tether-<session>" (what it read, its patch failures, its file-state record). Release exactly that, with
-    Hermes's own cleanup_vm; best effort. The terminal environment those tools ran in is not released here: Hermes
-    keys it by its container key ("default" on a device with the local backend), which this machine's own
-    sessionless runs share, so it is not Tether's to tear down (F80, D39)."""
+    """Hermes keeps per-task file state for the file tools it runs for this session, under the plugin's own task
+    for it (what it read, its patch failures, its file-state record). Release exactly that, with Hermes's public
+    ctx.release_tool_task (it reaches only this plugin's tasks and stops no shared container); best effort (F80,
+    D39)."""
+    ctx = _plugin_ctx()
+    if ctx is None:
+        return
     try:
-        from tools.terminal_tool_lifecycle import cleanup_vm
-        cleanup_vm(f"tether-{session}")
-    except Exception:  # noqa: BLE001 - Hermes not importable, or a teardown error: nothing to do here
+        ctx.release_tool_task(task_key(session))
+    except Exception:  # noqa: BLE001 - an older Hermes, or a teardown error: nothing to do here
         logger.debug("tether: file-tool task not released", exc_info=True)
 
 
@@ -665,19 +739,21 @@ def _cleanup(env: Any) -> None:
 DEVICE_TOOLS = frozenset({"read_file", "write_file", "patch", "search_files"})
 
 
-def _hermes_dispatch(name: str, args: dict[str, Any], task_id: str) -> Any:
-    """One lent file tool, run the way this machine's Hermes runs a tool outside its agent loop
-    (model_tools.handle_function_call): its tool_request middleware, its pre_tool_call hooks (block, approve,
-    modify), its edit approval, its tool_execution middleware, the tool, then its post_tool_call and
-    transform_tool_result hooks (D59). ctx.dispatch_tool is plain registry.dispatch and ran none of them."""
-    import model_tools
-    return model_tools.handle_function_call(name, args, task_id=task_id, session_id=task_id)
+def _hermes_dispatch(ctx: Any, name: str, args: dict[str, Any], session: str) -> Any:
+    """One lent file tool, run the way this machine's Hermes runs a tool outside its agent loop, through its public
+    ctx.run_tool_call: its tool_request middleware, its pre_tool_call hooks (block, approve, modify), its edit
+    approval, its tool_execution middleware, the tool, then its post_tool_call and transform_tool_result hooks (D59),
+    under the plugin's own task for this session. ctx.dispatch_tool is plain registry.dispatch and runs none of them."""
+    if ctx is None or not callable(getattr(ctx, "run_tool_call", None)):
+        raise PermissionError("this device's Hermes is too old to run a host's file tool with its own checks")
+    return ctx.run_tool_call(name, args, task_key=task_key(session))
 
 
 class ToolRunner:
     """Runs a host's file tool here, through this machine's own Hermes (_hermes_dispatch): its hooks, its paths,
     its file rules, its write fence, its credential protections, exactly as for local use (design D22). Only the
-    tools in DEVICE_TOOLS are lent; anything else is refused. ``dispatch`` replaces _hermes_dispatch (tests)."""
+    tools in DEVICE_TOOLS are lent; anything else is refused. ``dispatch(name, args, task_id=...)`` replaces
+    _hermes_dispatch (tests)."""
 
     def __init__(self, ctx: Any, local_exec: Any = None, workspaces: Any = None, dispatch: Any = None) -> None:
         self.ctx, self.local_exec, self.workspaces = ctx, local_exec, workspaces
@@ -693,6 +769,11 @@ class ToolRunner:
         stops = self.local_exec.stops_for(session, stop) if self.local_exec is not None else None
         return await _run_stoppable(self._run, name, tool_args, session, stops=stops, stop=stop)
 
+    def _task_id(self, session: str) -> str:
+        """The task id Hermes gives this session's file tools here (ctx.run_tool_call's plugin:<id>:<key>)."""
+        plugin_id = str(getattr(self.ctx, "plugin_id", "") or "tether")
+        return f"plugin:{plugin_id}:{task_key(session)}"
+
     def _base(self, session: str) -> str | None:
         cwd = self.local_exec.cwd_for(session) if self.local_exec is not None else None
         if cwd and os.path.isabs(cwd):
@@ -700,7 +781,7 @@ class ToolRunner:
         return str(self.workspaces.ensure(session)) if self.workspaces is not None else None
 
     def _run(self, name: str, tool_args: dict[str, Any], session: str) -> tuple[dict[str, Any], bytes]:
-        from .filebox import NO_BOX, install, serving
+        from .filebox import NO_BOX, serving
         from .identity import mask_secrets, shield_children
         from .lock import LockError, files_boxed, tool_refusal
         path = tool_args.get("path")
@@ -718,11 +799,10 @@ class ToolRunner:
             raise PermissionError(why)
         box = None
         if files_boxed() and self.dispatch is None:
-            # D79: Hermes's registry hands this call's tool body to the session's helper inside its lock; with no
-            # helper the call is refused, never run in this process.
+            # D79: tether's tool_execution middleware hands this call's tool body to the session's helper inside its
+            # lock, after Hermes's own checks; with no helper the call is refused, never run in this process.
             if self.local_exec is None:
                 raise LockError(NO_BOX.format(why="no session terminal on this device"))
-            install()
             box = self.local_exec.file_box(session, base or str(Path.home()))
         try:
             if _stop_pending():               # a stop reached this call before the tool ran: it does not run
@@ -733,8 +813,11 @@ class ToolRunner:
             shield_children()
             # This machine's own work: a tether terminal or middleware in this process (a machine that is also a
             # host) never sends it on to another machine.
-            with host_only(), serving(f"tether-{session}", box):
-                result = (self.dispatch or _hermes_dispatch)(name, tool_args, task_id=f"tether-{session}")
+            with host_only(), serving(self._task_id(session), box):
+                if self.dispatch is not None:
+                    result = self.dispatch(name, tool_args, task_id=self._task_id(session))
+                else:
+                    result = _hermes_dispatch(self.ctx, name, tool_args, session)
         finally:
             if _stop_pending():
                 # A stop may have cut the tool short: drop this task's file state (what it read, its patch count),

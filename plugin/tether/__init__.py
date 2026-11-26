@@ -32,7 +32,7 @@ def _in_gateway() -> bool:
 def register(ctx) -> None:
     from .tether import cli, forward, tools
     from .tether.config import read_settings
-    from .tether.provider import clear_guard_handoff, make_provider
+    from .tether.provider import make_provider
 
     def get(key, default=None):
         try:
@@ -40,6 +40,8 @@ def register(ctx) -> None:
         except Exception:  # noqa: BLE001 - inert on any doubt
             return default
 
+    from .tether.device_exec import set_plugin_context
+    set_plugin_context(ctx)             # lent file tools run through ctx.run_tool_call (device role)
     forward.record_process_origin()     # before any shell of this process runs: was it started from an agent's shell?
     # First, whatever the role and before any setting is parsed (a typo there must not leave the passphrase in
     # this process's environment, F74): every Hermes process the plugin loads in.
@@ -53,36 +55,58 @@ def register(ctx) -> None:
     ctx.register_hook("pre_llm_call", forward.turn_context)
     ctx.register_hook("post_llm_call", forward.turn_closed)
     ctx.register_hook("transform_tool_result", forward.skill_files)
-    ctx.register_hook("post_tool_call", clear_guard_handoff)
     s = read_settings(get)
     if not s.roles:
         logger.debug("tether: role is off; surfaces registered but inert")
+        return
+    if os.environ.get("HERMES_PLUGIN_HOST_PROCESS") == "1":
+        # Hermes's separate plugin host (plugins.isolation: host): no session, turn or sender crosses into it, so
+        # tether could not tell one session or one sender from another. It stays inert there (gauntlet 3.1 lock F2).
+        logger.warning("tether: loaded in Hermes's plugin host process, where sessions cannot be told apart; it "
+                       "stays off here. Run it in-process (plugins.isolation: in_process).")
         return
     _check_hermes_surfaces()
     _start_services(s, ctx)   # host: every process gets the link (owner or relay); device: gateway only
 
 
-# Private Hermes functions whose absence would silently switch a protection off (F81): (module, name, what is lost).
+# Public Hermes seams tether relies on (F81): (module, name, what happens without it). Every protection fails closed
+# without its seam (the call or command is refused); the warning says why.
 _HERMES_SURFACES = (
-    ("tools.interrupt", "set_interrupt", "Stop will not end a command running for the host or on a device"),
-    ("tools.interrupt", "is_interrupted", "Stop will not end a command running for the host or on a device"),
-    ("agent.redact_vault_values", "register_vault_redaction_value",
+    ("hermes_cli.middleware", "authorize_tool_call",
+     "file tools meant for a device are refused (Hermes's checks of the call cannot run here)"),
+    ("tools.patch_parser", "patch_file_paths", "V4A patches meant for a device are refused"),
+    ("agent.terminal_env_provider", "current_command_context", "the tether terminal backend refuses every command"),
+    ("tools.environments.base", "BaseEnvironment.supports_session_kernel",
+     "execute_code is refused over tether (its persistent kernel cannot be kept off a tethered machine)"),
+    ("tools.approval", "check_dangerous_command",
+     "a command a device's rules flag cannot be put to the person here, so it does not run"),
+    ("tools.approval_judge", "judge_command", "this device refuses every command from its host"),
+    ("tools.interrupt", "InterruptScope", "this device refuses remote work (a stop could not reach it)"),
+    ("tools.interrupt", "is_interrupted", "this device refuses remote work (a stop could not reach it)"),
+    ("tools.environments.local", "LocalEnvironment.wrap_argv",
+     "this Mac refuses remote commands (the session lock cannot be applied)"),
+    ("agent.redact_vault_values", "register_plugin_redaction_value",
      "the key passphrase will not be masked in Hermes's own tool output"),
     ("tools.skill_provenance", "is_background_review",
      "a background review is recognised by its thread name only"),
-    ("agent.delegation_context", "is_delegated_child_process_context",
+    ("hermes_cli.plugin_session", "in_delegated_child",
      "a delegated child process is recognised by its platform and environment only"),
+    ("hermes_cli.plugin_session", "turn_event",
+     "a forwarded or bot-written gateway message is recognised by its text only"),
 )
 
 
 def _check_hermes_surfaces() -> list:
-    """At role start: log, once per lost protection, each private Hermes function tether relies on that this Hermes
-    lacks (an update renamed or moved it). Returns what is lost (tests)."""
+    """At role start: log, once per lost protection, each public Hermes seam tether relies on that this Hermes lacks
+    (an older Hermes). Returns what is lost (tests)."""
     import importlib
     lost: list = []
     for module, name, effect in _HERMES_SURFACES:
         try:
-            ok = callable(getattr(importlib.import_module(module), name, None))
+            found = importlib.import_module(module)
+            for part in name.split("."):
+                found = getattr(found, part, None)
+            ok = callable(found) if "." not in name else found is not None   # Class.attr: the attribute exists
         except Exception:  # noqa: BLE001
             ok = False
         if not ok and effect not in lost:

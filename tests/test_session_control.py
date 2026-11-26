@@ -18,7 +18,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugin" / "tether"))
-sys.path.insert(1, str(Path.home() / ".hermes" / "hermes-agent"))
+sys.path.insert(1, str(Path(os.environ.get("HERMES_AGENT_SRC") or Path.home() / ".hermes" / "hermes-agent")))
 
 from tether import forward, machine, tools  # noqa: E402
 from tether.device_exec import LocalExec, SessionControl  # noqa: E402

@@ -5,7 +5,7 @@ files a running program holds open. Run them again after changes to the device s
 
 ## Set up the PC
 
-1. Install Hermes 0.23.3 and run it **in your signed-in session** (Hermes Desktop or `hermes`
+1. Install a Hermes that has the public plugin seams Tether 0.3.1 uses (see the README's Setup) and run it **in your signed-in session** (Hermes Desktop or `hermes`
    in a terminal). A background Windows service has no screen to show the consent box on, so every session
    would be denied.
 2. Copy `plugin/tether` from this repository into `%LOCALAPPDATA%\hermes\plugins\tether` (Hermes's home on Windows), then in
@@ -36,3 +36,5 @@ files a running program holds open. Run them again after changes to the device s
 | 7 | Tether panel on the host | `studio-pc` online beside `mac`: two machines, one agent |
 
 Validated on Windows 11 (Hermes 0.23.0): all seven checks passed on a real PC.
+
+Tether 0.3.1 on Windows 11 (Hermes built with the seams): a session approved with an authenticator code, commands and execute_code on the PC, and on untether the session folder removed, including a local git clone's read-only objects and a file another program held open (removed once it was released).

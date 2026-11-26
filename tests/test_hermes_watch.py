@@ -19,8 +19,9 @@ SCRIPTS = ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import hermes_watch as hw  # noqa: E402
+from test_link_loopback import remove_tree  # noqa: E402
 
-HERMES = Path.home() / ".hermes" / "hermes-agent"
+HERMES = Path(os.environ.get("HERMES_AGENT_SRC") or Path.home() / ".hermes" / "hermes-agent")
 
 FAKE = {
     "tools/__init__.py": "",
@@ -90,7 +91,7 @@ def write_tree(root: Path, files: dict) -> None:
 class Fake(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="hw-"))
-        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.addCleanup(remove_tree, self.tmp)
         self.src, self.plugin, self.base = self.tmp / "hermes", self.tmp / "plugin", self.tmp / "baseline.json"
         write_tree(self.src, FAKE)
         write_tree(self.plugin, PLUGIN)
@@ -166,13 +167,11 @@ class RealHermesTests(unittest.TestCase):
         derived = set(hw.derive_names(ROOT / "plugin", hw.Source(HERMES)))
         self.assertEqual(sorted(derived - set(self.data["names"])), [],
                          "the plugin uses Hermes names the baseline does not know: verify, then write it again")
-        for name in ("tools.environments.local.LocalEnvironment._run_bash",
-                     "tools.environments.local.LocalEnvironment._spawn_long_lived",
+        for name in ("tools.environments.local.LocalEnvironment.wrap_argv",
+                     "tools.environments.local.LocalEnvironment._run_bash",
                      "tools.environments.base.BaseEnvironment.execute",
-                     "tools.environments.base.BaseEnvironment.init_session",
-                     "tools.terminal_tool_sudo_askpass.sudo_askpass_supported_once",
-                     "tools.environments.local._make_run_env"):
-            self.assertIn(name, self.data["names"], f"the session lock's copy depends on {name}")
+                     "tools.environments.base.BaseEnvironment.init_session"):
+            self.assertIn(name, self.data["names"], f"the session lock depends on {name}")
 
     def test_silent_on_the_hermes_the_baseline_was_made_from(self):
         head = subprocess.run(["git", "-C", str(HERMES), "rev-parse", "HEAD"], capture_output=True, text=True).stdout

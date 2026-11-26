@@ -20,14 +20,14 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugin" / "tether"))
-sys.path.insert(1, str(Path.home() / ".hermes" / "hermes-agent"))
+sys.path.insert(1, str(Path(os.environ.get("HERMES_AGENT_SRC") or Path.home() / ".hermes" / "hermes-agent")))
 
 from tether import forward, runtime, tools  # noqa: E402
 from tether.provider import TetherEnvironment  # noqa: E402
 from tether.runtime import BgJob, get_runtime  # noqa: E402
 from tether.store import OpenSessions  # noqa: E402
 
-from test_link_loopback import isolate_session, Rig  # noqa: E402
+from test_link_loopback import isolate_session, through_hermes, Rig  # noqa: E402
 
 try:
     from agent.delegation_context import delegated_child_context
@@ -140,9 +140,9 @@ class LostConnectionTests(unittest.TestCase):
     def read_file(self, path, *, session, turn, conversation=""):
         """Hermes's read_file: the middleware forwards it to the device, or lets it run here."""
         with scoped_current_session_id(session):
-            out = forward.tool_execution(tool_name="read_file", args={"path": path}, session_id=session,
-                                         task_id=session, turn_id=turn, conversation_id=conversation,
-                                         next_call=lambda a: (self.host_ran.append(f"read_file {path}"), "HOST")[1])
+            out = through_hermes("read_file", {"path": path},
+                                 lambda a: (self.host_ran.append(f"read_file {path}"), "HOST")[1], session_id=session,
+                                 task_id=session, turn_id=turn, conversation_id=conversation)
         return out if isinstance(out, dict) else (json.loads(out) if out.startswith("{") else out)
 
     def idle_out(self, session):
@@ -243,9 +243,9 @@ class LostConnectionTests(unittest.TestCase):
         self.rt.last_activity["S1"] = time.monotonic() - 5
         first = self.terminal(env, "make deploy", session="S1", turn="T1")
         with scoped_current_session_id("S1"):
-            second = forward.tool_execution(tool_name="write_file", args={"path": "/Users/z/out.txt", "content": "x"},
-                                            session_id="S1", task_id="S1", turn_id="T1",
-                                            next_call=lambda a: (self.host_ran.append("write_file"), "HOST")[1])
+            second = through_hermes("write_file", {"path": "/Users/z/out.txt", "content": "x"},
+                                    lambda a: (self.host_ran.append("write_file"), "HOST")[1], session_id="S1",
+                                    task_id="S1", turn_id="T1")
         self.assertIn("did not run anywhere", first["output"])
         self.assertIn("did not run anywhere", second)
         self.assertEqual(self.host_ran, [], "work meant for the mac ran on this host")

@@ -24,7 +24,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugin" / "tether"))
-sys.path.insert(1, str(Path.home() / ".hermes" / "hermes-agent"))
+sys.path.insert(1, str(Path(os.environ.get("HERMES_AGENT_SRC") or Path.home() / ".hermes" / "hermes-agent")))
 
 from tether import device_exec, store, tlslink, workspace  # noqa: E402
 from tether.device import DeviceService  # noqa: E402
@@ -202,6 +202,7 @@ class HardLinkTests(_WorkspaceCase):
         signed.write_text("%PDF")
         os.chmod(tool, 0o755)
         os.chmod(signed, 0o444)
+        tool_mode, signed_mode = mode(tool), mode(signed)                # what this OS keeps of those modes
         ws = self.ws.ensure("s1")
         os.link(tool, ws / "deploy-link.sh")                              # ln ~/deploy.sh .
         (ws / "ro").mkdir()
@@ -209,8 +210,8 @@ class HardLinkTests(_WorkspaceCase):
         os.chmod(ws / "ro", 0o500)                                        # inside a read-only folder too
         self.assertTrue(self.ws.wipe("s1"))
         self.assertFalse(ws.exists())
-        self.assertEqual(mode(tool), 0o755)
-        self.assertEqual(mode(signed), 0o444)
+        self.assertEqual(mode(tool), tool_mode)
+        self.assertEqual(mode(signed), signed_mode)
         self.assertEqual(os.stat(tool).st_nlink, 1)
 
     @unittest.skipUnless(shutil.which("git"), "git not installed")
@@ -383,7 +384,7 @@ class WindowsReadOnlyTests(_PathVariant, _WorkspaceCase):
     """F50 on Windows: deleting a read-only file there needs its read-only mark cleared, and on a hard link that mark
     is the person's own file's. Windows' refusal is simulated; the path-based code is the one Windows runs."""
 
-    def test_the_read_only_mark_is_cleared_only_on_a_file_with_no_other_name(self):
+    def _setup(self):
         home = user_folder(self)
         own = home / "signed.pdf"
         own.write_text("%PDF")
@@ -398,10 +399,37 @@ class WindowsReadOnlyTests(_PathVariant, _WorkspaceCase):
             if not os.path.islink(path) and not os.lstat(path).st_mode & stat.S_IWRITE:
                 raise PermissionError(5, "Access is denied")
             return real_unlink(path, *a, **k)
-        with mock.patch("os.unlink", windows_unlink):
+        return own, ws, real_unlink, windows_unlink
+
+    def test_the_read_only_mark_is_cleared_only_on_a_file_with_no_other_name(self):
+        own, ws, real_unlink, windows_unlink = self._setup()
+        named = []
+        real_delete = workspace._delete_name_keeping_mark
+
+        def keep_mark(path, st):                                          # elsewhere: stands for FileDispositionInfoEx
+            named.append((stat.S_IMODE(os.lstat(path).st_mode), st.st_nlink))
+            if sys.platform == "win32":
+                real_delete(path, st)                                     # Windows: the real call
+            else:
+                real_unlink(path)
+        with mock.patch("os.unlink", windows_unlink), \
+                mock.patch.object(workspace, "_delete_name_keeping_mark", keep_mark):
+            self.assertTrue(self.ws.wipe("s1"))                           # a git clone's objects no longer hold it
+        self.assertFalse(ws.exists())
+        self.assertEqual(named, [(mode(own), 2)])                         # removed by name, the mark untouched
+        self.assertEqual(mode(own), 0o444)                                # the person's file kept its mark
+        self.assertEqual(os.stat(own).st_nlink, 1)
+
+    def test_a_hard_link_windows_refuses_to_remove_stays_for_the_sweeper(self):
+        own, ws, _, windows_unlink = self._setup()
+
+        def refused(path, st):
+            raise PermissionError(5, "Access is denied")
+        with mock.patch("os.unlink", windows_unlink), \
+                mock.patch.object(workspace, "_delete_name_keeping_mark", refused):
             self.assertFalse(self.ws.wipe("s1"))                          # the hard link stays, logged, retried
         self.assertFalse((ws / "copy.txt").exists())                      # the session's own read-only file went
-        self.assertEqual(mode(own), 0o444)                                # the person's file kept its mark
+        self.assertEqual(mode(own), 0o444)
         self.assertTrue((ws / "signed.pdf").exists())
 
 
@@ -460,7 +488,7 @@ _START_CHILD = textwrap.dedent("""
     from unittest import mock
     tests = Path(sys.argv[1])
     sys.path.insert(0, str(tests))
-    sys.path.insert(1, str(Path.home() / ".hermes" / "hermes-agent"))
+    sys.path.insert(1, str(Path(os.environ.get("HERMES_AGENT_SRC") or Path.home() / ".hermes" / "hermes-agent")))
     from test_plugin_register import Ctx, load_plugin
     plugin = load_plugin()
     error = ""

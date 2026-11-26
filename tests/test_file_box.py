@@ -18,7 +18,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-HERMES_SRC = Path.home() / ".hermes" / "hermes-agent"
+HERMES_SRC = Path(os.environ.get("HERMES_AGENT_SRC") or Path.home() / ".hermes" / "hermes-agent")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugin" / "tether"))
 sys.path.insert(1, str(HERMES_SRC))
 
@@ -77,14 +77,22 @@ class BoxedFileToolTests(unittest.TestCase):
             (d.data / name).write_text(f'{{"sealed": "{SECRET}"}}\n')
         (d.data / "settings.json").write_text("{}\n")
         (d.home / "work" / "notes.txt").write_text("mine\n")
-        isolated_plugins(self)
-        from tether.device_exec import LocalExec, ToolRunner
+        manager = isolated_plugins(self)
+        from hermes_cli.plugins_context import PluginContext
+        from hermes_cli.plugins_manifest import PluginManifest
+        from tether import forward
+        from tether.device_exec import LocalExec, ToolRunner, set_plugin_context
         from tether.workspace import Workspaces
+        # As register() sets it up: tether's middleware in the chain, the plugin's ctx kept for the lent tools.
+        manager._middleware.setdefault("tool_execution", []).append(forward.tool_execution)
+        self.ctx = PluginContext(PluginManifest(name="tether"), manager)
+        set_plugin_context(self.ctx)
+        self.addCleanup(set_plugin_context, None)
         self.workspaces = Workspaces(d.data / "sessions")
         self.addCleanup(self.workspaces.close)
         self.loc = LocalExec(self.workspaces)
         self.addCleanup(self.loc.close_all)
-        self.runner = ToolRunner(None, self.loc, self.workspaces)
+        self.runner = ToolRunner(self.ctx, self.loc, self.workspaces)
         self.ws = self.workspaces.ensure("s1")
         self.before = {p: p.read_bytes() for p in d.data.glob("*.json")}
 
@@ -210,22 +218,20 @@ class BoxedFileToolTests(unittest.TestCase):
         self.assertFalse(target.exists())
 
     def test_a_session_call_reaching_hermes_without_its_helper_is_refused(self):
-        """The registry itself refuses a remote session's file tool that no locked helper serves; the device's own
-        calls are untouched."""
-        from tether import filebox
+        """Tether's middleware refuses a remote session's lent file tool that no locked helper serves (it never runs
+        in this process); the device's own calls are untouched."""
         from tools import terminal_tool
-        from tools.registry import registry
         if "default" not in terminal_tool._active_environments:      # the own call below makes Hermes's shared
             from tools.file_tools import clear_file_ops_cache            # terminal here: not left for other tests
             from tools.terminal_tool_lifecycle import cleanup_vm
             self.addCleanup(clear_file_ops_cache, "default")
             self.addCleanup(cleanup_vm, "default")
-        filebox.install()
         target = self.dev.home / "work" / "direct.txt"
-        out = registry.dispatch("write_file", {"path": str(target), "content": "x"}, task_id="tether-zz")
+        out = self.ctx.run_tool_call("write_file", {"path": str(target), "content": "x"}, task_key="zz")
         self.assertIn("was not run", str(out))
         self.assertFalse(target.exists())
-        registry.dispatch("write_file", {"path": str(target), "content": "own"}, task_id="default")
+        import model_tools
+        model_tools.handle_function_call("write_file", {"path": str(target), "content": "own"}, task_id="default")
         self.assertEqual(target.read_text(), "own")
 
     def test_the_helper_ends_with_the_session(self):

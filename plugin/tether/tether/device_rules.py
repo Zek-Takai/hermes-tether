@@ -1,66 +1,35 @@
 """Device side: judge a host's command with THIS machine's own Hermes approval rules (design D25).
 
 Hermes's own command gate runs in the host session first, as Hermes always runs it (its card, its
-session/always answers). When it did (``host_gate``), this device adds only its floors. A command that did
-not pass that gate (``host_gate`` false) gets this device's full rules:
+session/always answers). When a person or Hermes's rules approved the command there (``host_gate``), this
+device adds only its floors. A command that did not pass that gate (``host_gate`` false) gets this device's
+full rules, through Hermes's public ``tools.approval_judge.judge_command``:
 
 - ``block``: one of this device's floors (hardline, runtime self-delete, ``sudo -S`` guess, its own
-  ``approvals.deny`` rules). Final; nobody can approve it.
+  ``approvals.deny`` rules), a command its hardline scan cannot read to the end while approvals are off, or a
+  rule check that could not run. Final; nobody can approve it.
 - ``ask``: this device's dangerous-command patterns flag it and nothing here pre-approves it (its approval
   mode, its permanent allowlist, its saved "always" answers). The host must get a yes from the human in the
   session and resend with ``approved_keys``.
 - ``run``: clean, allowlisted, already approved, or this device runs with approvals off.
 
-Hermes keeps these checks in ``tools.approval``; its public ``check_all_command_guards`` cannot be used here
-because a device thread has no CLI or gateway attached, and Hermes then approves unattended commands. If
-those helpers are missing (another Hermes version), the device fails closed: every flagged command asks.
+Without that seam (an older Hermes) every command is refused.
 """
 from __future__ import annotations
 
-import logging
 from typing import Any, Iterable
 
-logger = logging.getLogger(__name__)
+NO_JUDGE = "this device cannot check commands against its Hermes rules (its Hermes is too old for this Tether)"
 
 
 def judge(command: str, approved_keys: Iterable[str] = (), host_gate: bool = False) -> tuple[str, dict[str, Any]]:
-    granted = {str(k) for k in approved_keys or ()}
     try:
-        from tools import approval as A
-        from tools import approval_context as C
+        from tools.approval_judge import judge_command
     except ImportError:
-        return _fallback(command, granted, host_gate)
-    try:
-        blocked = A._floor_block(command, sudo_guard=True)
-        if blocked is not None:
-            return "block", {"reason": blocked.get("message") or "blocked by this device's Hermes rules"}
-        if host_gate:
-            return "run", {}
-        if C._get_approval_mode() == "off":
-            return "run", {}
-        if A._command_matches_permanent_allowlist(command):
-            return "run", {}
-        pending = [(k, d) for k, d in A._command_findings(command)
-                   if k not in granted and not A._is_permanently_approved(k)]
-    except Exception:  # noqa: BLE001 - a rule check that cannot run must not wave the command through
-        logger.warning("tether: device rule check failed; asking", exc_info=True)
-        return _fallback(command, granted, host_gate)
-    if not pending:
-        return "run", {}
-    return "ask", {"pattern_keys": [k for k, _ in pending], "description": "; ".join(d for _, d in pending)}
-
-
-def _fallback(command: str, granted: set[str], host_gate: bool = False) -> tuple[str, dict[str, Any]]:
-    try:
-        from tools.approval_detection import detect_dangerous_command, detect_hardline_command
-    except ImportError:
-        return "block", {"reason": "this device cannot check commands against its Hermes rules"}
-    hard, why = detect_hardline_command(command)
-    if hard:
-        return "block", {"reason": f"blocked on this device by Hermes's hardline rules: {why}"}
-    if host_gate:
-        return "run", {}
-    dangerous, key, description = detect_dangerous_command(command)
-    if dangerous and key not in granted:
-        return "ask", {"pattern_keys": [key], "description": description}
+        return "block", {"reason": NO_JUDGE}
+    verdict = judge_command(command, approved_keys=approved_keys or (), gate_approved=bool(host_gate))
+    if verdict.verdict == "block":
+        return "block", {"reason": verdict.reason or "blocked by this device's Hermes rules"}
+    if verdict.verdict == "ask":
+        return "ask", {"pattern_keys": list(verdict.pattern_keys), "description": verdict.description or ""}
     return "run", {}

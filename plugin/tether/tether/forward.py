@@ -2,10 +2,11 @@
 
 Host side, all through public plugin surfaces:
 - ``tool_execution`` middleware hands the file tools (read_file, write_file, patch, search_files) whole to the
-  device, whose own Hermes runs them (``model_tools.handle_function_call`` there: its hooks, its middleware) with
-  its own paths, file rules, write fence and credential protections. Hermes's own checks of the call (its
-  pre_tool_call hooks, compression-marker guard, loop guardrails and ACP edit approval) run here first: in Hermes's
-  agent loop they sit inside next_call, which a forwarded call never reaches (D59). Terminal and computer use
+  device, whose own Hermes runs them (``ctx.run_tool_call`` there: its hooks, its middleware) with its own paths,
+  file rules, write fence and credential protections. Hermes's own checks of the call (its pre_tool_call hooks,
+  compression-marker guard, loop guardrails and ACP edit approval) run here first, through Hermes's public
+  ``authorize_tool_call``: in its agent loop they sit inside next_call, which a forwarded call never reaches (D59).
+  Terminal and computer use
   already run on the device through the tether backend and the tether_screen provider, with the session's
   approvals.
 - ``pre_llm_call`` tells the model once per turn which machine it is working on and whose rules apply, so the
@@ -19,11 +20,9 @@ import logging
 import os
 import posixpath
 import re
-import sys
 import tarfile
 import threading
 import time
-import types
 from pathlib import Path
 from typing import Any, Optional
 
@@ -51,9 +50,6 @@ _facts: dict[str, tuple[float, str, dict[str, Any]]] = {}
 
 SKILL_COPY_MAX_BYTES = 20 * 1024 * 1024
 _SKIP_DIRS = frozenset({"__pycache__", ".git", "node_modules", ".venv", "venv", ".mypy_cache"})
-# V4A headers, as Hermes's patch tool reads them (tools/file_tools.py); used only if its reader is not importable.
-_V4A_SINGLE_RE = re.compile(r"^(\*\*\*\s*(Update|Add|Delete)\s+File:\s*)(.+)$", re.MULTILINE)
-_V4A_MOVE_RE = re.compile(r"^(\*\*\*\s*Move\s+File:\s*)(.+?)\s*->\s*(.+)$", re.MULTILINE)
 
 
 def target_for(session_id: Optional[str]) -> Optional[str]:
@@ -110,25 +106,13 @@ def _device_workspace(path: str, home: str) -> bool:
     return bool(name) and within(path, os.path.join(profiles, name, "tether", "sessions"))
 
 
-def _v4a_header_names_regex(patch: str) -> Optional[list[str]]:
-    """The files a V4A patch names in its headers, read with the two patterns Hermes's patch tool uses."""
-    names = [m.group(3).strip() for m in _V4A_SINGLE_RE.finditer(patch)]
-    names += [g.strip() for m in _V4A_MOVE_RE.finditer(patch) for g in (m.group(2), m.group(3))]
-    return names or None
-
-
 def _v4a_names(patch: Any) -> Optional[list[str]]:
-    """Every file a V4A patch names, or None when they cannot be read (Hermes's own reader when importable)."""
+    """Every file a V4A patch names, read by Hermes's own reader (tools.patch_parser.patch_file_paths), or None
+    when they cannot be read (no file named, or a header Hermes refuses): a refusal, never "no files"."""
     if not isinstance(patch, str) or not patch:
         return None
-    try:
-        from tools.file_tools import _collect_v4a_header_paths
-        collected = _collect_v4a_header_paths(patch)
-        if isinstance(collected, tuple) and collected[0]:
-            return list(collected[0])
-        return None
-    except Exception:  # noqa: BLE001 - Hermes's reader is missing or changed: the same patterns it uses
-        return _v4a_header_names_regex(patch)
+    from tools.patch_parser import patch_file_paths
+    return patch_file_paths(patch)
 
 
 def _is_review() -> bool:
@@ -188,8 +172,8 @@ def _unattended(kwargs: dict[str, Any]) -> bool:
     except Exception:  # noqa: BLE001
         pass
     try:
-        from agent.delegation_context import is_delegated_child_process_context
-        if is_delegated_child_process_context():
+        from hermes_cli.plugin_session import in_delegated_child
+        if in_delegated_child(include_subprocesses=True):
             return True
     except Exception:  # noqa: BLE001
         pass
@@ -199,7 +183,7 @@ def _unattended(kwargs: dict[str, Any]) -> bool:
 def _session_sources() -> set[str]:
     """The run's session source as Hermes records it, from all three places it can be: the process environment
     (`hermes chat --source tool` sets it there, hermes_cli/main.py), the gateway's bound session context, and a
-    managed worker's frozen launch policy (gateway/session_policy.py active_policy; its worker binds an empty source).
+    managed worker's launch policy (hermes_cli.plugin_session.session_source; its worker binds an empty source).
     The gateway daemon strips HERMES_SESSION_SOURCE from its own environment, so the user's chats are not affected."""
     sources = {os.environ.get("HERMES_SESSION_SOURCE", "")}
     try:
@@ -208,20 +192,20 @@ def _session_sources() -> set[str]:
     except Exception:  # noqa: BLE001 - outside Hermes
         pass
     try:
-        from gateway.session_policy import active_policy
-        sources.add(str(getattr(active_policy(), "source", "") or ""))
+        from hermes_cli.plugin_session import session_source
+        sources.add(str(session_source() or ""))
     except Exception:  # noqa: BLE001
         pass
     return {s.strip() for s in sources} - {""}
 
 
 def _turn_event() -> Any:
-    """The MessageEvent of the running gateway turn, as Hermes binds it for this context (gateway/session_context.py
-    _SESSION_TURN_EVENT, set by GatewayRunner._set_session_env and scoped_turn_actor). None outside a gateway turn
-    (classic CLI, TUI) or when it cannot be read: every check that uses it is an extra refusal, never a permission."""
+    """Hermes's frozen view of the running gateway turn's event (hermes_cli.plugin_session.turn_event). None outside
+    a gateway turn (classic CLI, TUI) or when it cannot be read: every check that uses it is an extra refusal, never
+    a permission."""
     try:
-        from gateway.session_context import _SESSION_TURN_EVENT
-        return _SESSION_TURN_EVENT.get()
+        from hermes_cli.plugin_session import turn_event
+        return turn_event()
     except Exception:  # noqa: BLE001
         return None
 
@@ -242,32 +226,12 @@ def _self_injected(kwargs: dict[str, Any], raw: str) -> bool:
         return True
     event = _turn_event()
     if event is not None:
-        # internal: a synthetic event (gateway/platforms/event.py); inherit_channel_pin: a goal continuation,
-        # heartbeat or /goal resume (gateway/run_goals.py, slash_commands_goals.py); is_bot: a bot or webhook author.
+        # internal: a synthetic event; inherit_channel_pin: a goal continuation, heartbeat or /goal resume; is_bot: a
+        # bot or webhook author.
         if getattr(event, "internal", False) or getattr(event, "inherit_channel_pin", False) \
-                or getattr(getattr(event, "source", None), "is_bot", False):
+                or getattr(event, "is_bot", False):
             return True
     return hermes_wrote(raw, **_sender(kwargs))
-
-
-def _forwarded(event: Any) -> bool:
-    """True when the gateway turn's message is a forward Hermes passes on as plain text: a Discord forward (its
-    text comes from message_snapshots, discord/adapter.py), a Telegram forward (forward_origin, python-telegram-bot
-    22) or a Feishu merged forward. Only the message Hermes keeps as raw_message is seen: a Telegram forward that
-    Hermes batched behind a typed comment, and WhatsApp forwards, are not (a stated limit)."""
-    raw = getattr(event, "raw_message", None)
-    platform = str(getattr(getattr(getattr(event, "source", None), "platform", None), "value", "") or "")
-    try:
-        if platform == "discord":
-            return bool(getattr(raw, "message_snapshots", None))
-        if platform == "telegram":
-            return getattr(raw, "forward_origin", None) is not None
-        if platform == "feishu":
-            message = getattr(getattr(raw, "event", None), "message", None)
-            return getattr(message, "message_type", None) == "merge_forward"
-    except Exception:  # noqa: BLE001 - an odd raw message: judged by its text alone
-        return False
-    return False
 
 
 def _sender(kwargs: dict[str, Any]) -> dict[str, str]:
@@ -343,6 +307,10 @@ def tool_execution(**kwargs: Any) -> Any:
 
 def _tool_execution(**kwargs: Any) -> Any:
     name, args, next_call = kwargs.get("tool_name"), kwargs.get("args") or {}, kwargs["next_call"]
+    from .filebox import lent_call
+    boxed = lent_call(kwargs)                            # device side: a host's lent file tool, in its session lock
+    if boxed is not None:
+        return boxed
     if _host_only_active():
         # This thread's work is already this machine's own: a host-owned call's inner work, or a file tool this
         # machine runs for its host as a device (device_exec.ToolRunner). It runs here, as is.
@@ -371,19 +339,20 @@ def _tool_execution(**kwargs: Any) -> Any:
         return next_call(args)
     if refusal:
         return json.dumps({"error": refusal})
-    # D59: Hermes's own checks of this call, which in its agent loop run inside next_call (never reached below).
-    site, agent = _authorization_site()
-    if site != "done":
-        stopped, args = _host_gates(name, args, kwargs, agent)
-        if stopped is not None:
-            return stopped
-        host, refusal = _judge(name, args, target)       # a pre_tool_call 'modify' may have changed the paths
-        if refusal or host:
-            return json.dumps({"error": refusal or (
-                "tether: a plugin on this host changed this call so that it names a file in this host's own Hermes "
-                "home, so it did not run anywhere. Tell the user; do not retry it.")})
+    # D59: Hermes's own checks of this call (in its agent loop they run inside next_call, never reached below),
+    # through its public authorize_tool_call: hooks (block, approve, modify), compression-marker guard, loop
+    # guardrails and ACP edit approval. A refusal is already reported; it is returned unchanged.
+    from hermes_cli.middleware import authorize_tool_call
+    decision = authorize_tool_call(args)
+    if not decision.allowed:
+        return decision.result
+    args = decision.args
+    host, refusal = _judge(name, args, target)           # a pre_tool_call 'modify' may have changed the paths
+    if refusal or host:
+        return json.dumps({"error": refusal or (
+            "tether: a plugin on this host changed this call so that it names a file in this host's own Hermes "
+            "home, so it did not run anywhere. Tell the user; do not retry it.")})
     get_runtime().note_device_use(None, target, kwargs.get("session_id") or None)   # by session, never by key
-    started = time.monotonic()
     try:
         meta, body = get_runtime().call_target(
             "tool", {"name": name, "args": _absolute(dict(args), kwargs.get("task_id"))},
@@ -404,7 +373,7 @@ def _tool_execution(**kwargs: Any) -> Any:
         if not isinstance(data, dict):
             return json.dumps({"error": _bad_reply(target)})
         result = data
-    return _transform(name, args, result, kwargs, started) if site == "loop" else result
+    return result                                        # Hermes applies post_tool_call and transform_tool_result
 
 
 def _judge(name: Any, args: dict[str, Any], target: str) -> tuple[bool, Optional[str]]:
@@ -422,84 +391,6 @@ def _judge(name: Any, args: dict[str, Any], target: str) -> tuple[bool, Optional
                            "anywhere. Send one patch per machine.")
         return owners.pop(), None
     return _host_owned(args.get("path")), None
-
-
-# Hermes 0.23.3 runs tool_execution middleware from three places. Only its agent loop (tool_executor's
-# _run_agent_tool_execution_middleware, inner function _hermes_pipeline) puts the call's checks inside next_call:
-# pre_tool_call hooks, the compression-marker guard and the loop guardrails, then handle_function_call's ACP edit
-# approval and transform_tool_result. model_tools._execute_tool (handle_function_call outside the agent loop:
-# execute_code, the code kernel, the MCP bridge, connectors) runs the hooks and ACP edit approval before the
-# middleware. The middleware cannot tell them apart from its arguments, so it looks at its callers.
-_HOOK_IDS = ("task_id", "session_id", "tool_call_id", "turn_id", "api_request_id", "conversation_id")
-_FRAMES_UP = 80
-
-
-def _authorization_site() -> tuple[str, Any]:
-    """Where Hermes runs this call's checks, seen from the middleware: ("loop", agent) inside next_call (Hermes's
-    agent loop; agent is its AIAgent, for the guardrails); ("done", None) before the middleware
-    (handle_function_call); ("unknown", None) when neither caller is found, and every check that can run without
-    the agent runs here (a check is never skipped because its caller is not recognised)."""
-    # Looked up, never imported: a caller that is not loaded cannot be on the stack (and importing model_tools runs
-    # Hermes's plugin discovery).
-    model_tools, tool_executor = sys.modules.get("model_tools"), sys.modules.get("agent.tool_executor")
-    outer = getattr(getattr(tool_executor, "_run_agent_tool_execution_middleware", None), "__code__", None)
-    loop = next((c for c in getattr(outer, "co_consts", ()) if isinstance(c, types.CodeType)
-                 and c.co_name == "_hermes_pipeline"), None)
-    done = getattr(getattr(model_tools, "_execute_tool", None), "__code__", None)
-    frame = sys._getframe(1)
-    for _ in range(_FRAMES_UP):
-        if frame is None:
-            break
-        if done is not None and frame.f_code is done:
-            return "done", None
-        if loop is not None and frame.f_code is loop:
-            return "loop", frame.f_locals.get("agent")
-        frame = frame.f_back
-    return "unknown", None
-
-
-def _host_gates(name: Any, args: dict[str, Any], kwargs: dict[str, Any], agent: Any) -> tuple[Any, dict[str, Any]]:
-    """Hermes's own checks of a tool call, run here before a file call goes to the device, in Hermes's order
-    (agent/tool_executor._dispatch_authorized_once, then model_tools._pre_dispatch_guards): the pre_tool_call hooks
-    (block; approve, which asks a person; modify), the compression-marker guard, the agent's loop guardrails (when
-    the agent is known) and ACP edit approval. Returns (result, args): the result the model reads when a check
-    stops the call (None to go on) and the arguments after any modify. A check that raises makes the middleware
-    refuse the call (tool_execution): a forwarded call never goes ahead unchecked."""
-    ids = {key: str(kwargs.get(key) or "") for key in _HOOK_IDS}
-    from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
-    block, modified = _dispatch_pre_tool_call_hooks(name, args, middleware_trace=[], **ids)
-    if block is not None:
-        return json.dumps({"error": block}, ensure_ascii=False), args
-    if isinstance(modified, dict):
-        args = modified
-    from agent.tool_dispatch_helpers import _context_pruned_argument_paths
-    pruned = _context_pruned_argument_paths(name, args)
-    if pruned:
-        from agent.tool_executor import _PRUNED_TOOL_ARGUMENTS_ERROR, _PRUNED_TOOL_ARGUMENTS_MESSAGE
-        return json.dumps({"error": _PRUNED_TOOL_ARGUMENTS_ERROR, "message": _PRUNED_TOOL_ARGUMENTS_MESSAGE,
-                           "argument_paths": pruned}, ensure_ascii=False), args
-    if agent is not None:
-        decision = agent._tool_guardrails.before_call(name, args)
-        if not decision.allows_execution:
-            return agent._guardrail_block_result(decision), args
-    from acp_adapter.edit_approval import maybe_require_edit_approval
-    denied = maybe_require_edit_approval(name, args)
-    if denied is not None:
-        return denied, args
-    return None, args
-
-
-def _transform(name: Any, args: dict[str, Any], result: Any, kwargs: dict[str, Any], started: float) -> Any:
-    """transform_tool_result for a device's result. In its agent loop Hermes leaves this hook to
-    handle_function_call, which a forwarded call never reaches. The call has run on the device by now, so a
-    failure here keeps the result as it is (Hermes's own hook runner is fail-open too)."""
-    try:
-        from model_tools import _CallIds, _apply_transform_tool_result_hook
-        ids = _CallIds(**{key: str(kwargs.get(key) or "") for key in _HOOK_IDS})
-        return _apply_transform_tool_result_hook(name, args, result, int((time.monotonic() - started) * 1000), ids)
-    except Exception:  # noqa: BLE001
-        logger.debug("tether: transform_tool_result not applied to a device result", exc_info=True)
-        return result
 
 
 def _bad_reply(target: str) -> str:
@@ -550,7 +441,8 @@ def turn_context(session_id: str = "", user_message: Any = "", **kwargs: Any) ->
     rt.turn_open[session_id] = True
     words, added = user_words(raw, **_sender(kwargs))
     event = _turn_event()
-    if words and event is not None and _forwarded(event):
+    # A forward Hermes passes on as plain text (a Discord, Telegram or Feishu forward), as Hermes reads the message.
+    if words and event is not None and getattr(event, "forwarded", False):
         words, added = "", True                          # a forward is someone else's text, even when it says tether
     rt.turn_text[session_id] = words                     # only what the user typed may open or close (D23, D31)
     rt.turn_wrapped[session_id] = added                  # Hermes added text that was refused or dropped

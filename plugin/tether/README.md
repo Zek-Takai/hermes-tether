@@ -33,7 +33,7 @@ untether        → back on the host; the Mac empties the session workspace
 
 ## Install
 
-Requires Hermes **0.23.3** on the host and on each machine. Install `tether` on both. For computer
+Requires a Hermes with the public plugin seams from [NousResearch/hermes-agent#160267](https://github.com/NousResearch/hermes-agent/pull/160267), [#160268](https://github.com/NousResearch/hermes-agent/pull/160268) and [#160269](https://github.com/NousResearch/hermes-agent/pull/160269) on the host and on each machine (until they are released, a Hermes built from those changes; without them Tether refuses remote use and says why). Install `tether` on both. For computer
 use, also copy `plugin/tether_screen` from the repository into the same `plugins/` folder (it is installed
 by hand, not from the catalog) and set `computer_use.backend: tether_screen` on the host. Set
 `role: host` on the agent's Hermes and `role: device` on each machine, then pair once: `hermes tether pair

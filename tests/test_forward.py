@@ -13,13 +13,13 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugin" / "tether"))
-sys.path.insert(1, str(Path.home() / ".hermes" / "hermes-agent"))
+sys.path.insert(1, str(Path(os.environ.get("HERMES_AGENT_SRC") or Path.home() / ".hermes" / "hermes-agent")))
 
 from tether import forward, machine, provider  # noqa: E402
 from tether.device_exec import ToolRunner  # noqa: E402
 from tether.runtime import get_runtime  # noqa: E402
 
-from test_link_loopback import isolate_session, isolated_plugins, no_plugin_discovery, temp_dir, Rig  # noqa: E402
+from test_link_loopback import isolate_session, isolated_plugins, no_plugin_discovery, temp_dir, through_hermes, Rig  # noqa: E402
 
 try:
     no_plugin_discovery()           # before model_tools: importing it would load the plugins of the real ~/.hermes
@@ -65,7 +65,9 @@ class ToolRunnerTests(unittest.TestCase):
         self.assertEqual((meta, body), ({}, b'{"ok": true}'))
         meta, body = self.run_tool(runner, name="patch", args={"path": "/x"}, session="s1")
         self.assertEqual((meta, json.loads(body)), ({"json_dict": True}, {"_multimodal": True, "x": 1}))
-        self.assertEqual(ctx.calls[0][2], {"task_id": "tether-s1"})
+        self.assertEqual(ctx.calls[0][2], {"task_id": runner._task_id("s1")})
+        self.assertNotEqual(runner._task_id("s1"), runner._task_id("s2"))
+        self.assertNotIn(":", runner._task_id("a:b").split(":", 2)[2])     # a session id's ':' never reaches Hermes
 
     def test_relative_paths_resolve_in_the_session_workspace(self):
         from tether.workspace import Workspaces
@@ -122,7 +124,15 @@ class ToolRunnerTests(unittest.TestCase):
 
     def device_runner(self, ctx=None):
         """A runner with this device's terminals (a fake HOME and Hermes home): on a Mac the lent tools then run
-        inside the session's lock (D79), as on a real device; elsewhere in this process."""
+        inside the session's lock (D79), as on a real device; elsewhere in this process. With a real ctx, tether's
+        middleware is in its manager's chain, as register() puts it, and the plugin's ctx is the one kept."""
+        if ctx is not None and getattr(ctx, "_manager", None) is not None:
+            from tether.device_exec import set_plugin_context
+            chain = ctx._manager._middleware.setdefault("tool_execution", [])
+            chain.append(forward.tool_execution)
+            self.addCleanup(chain.remove, forward.tool_execution)
+            set_plugin_context(ctx)
+            self.addCleanup(set_plugin_context, None)
         from test_session_lock import FakeDevice
         from tether.device_exec import LocalExec
         from tether.workspace import Workspaces
@@ -135,8 +145,10 @@ class ToolRunnerTests(unittest.TestCase):
 
     @unittest.skipUnless(HAVE_HERMES, "Hermes source not importable")
     def test_real_file_tools_with_this_machines_rules(self):
-        isolated_plugins(self)
-        dev, runner = self.device_runner()               # this machine's own Hermes: handle_function_call
+        from hermes_cli.plugins_context import PluginContext
+        from hermes_cli.plugins_manifest import PluginManifest
+        manager = isolated_plugins(self)
+        dev, runner = self.device_runner(PluginContext(PluginManifest(name="tether"), manager))   # ctx.run_tool_call
         home = str(dev.home)                             # a throwaway HOME: a failed denial lands here
         target = temp_dir(self, "hp-dev-") / "hello.md"
         with mock.patch.dict(os.environ, {"HERMES_WRITE_SAFE_ROOT": ""}):
@@ -236,8 +248,7 @@ class MiddlewareTests(unittest.TestCase):
         self.rt.host = None
 
     def call(self, name, args, task_id="t1", turn_id=""):
-        return forward.tool_execution(tool_name=name, args=args, next_call=lambda a: "LOCAL", session_id="default",
-                                      task_id=task_id, turn_id=turn_id)
+        return through_hermes(name, args, lambda a: "LOCAL", session_id="default", task_id=task_id, turn_id=turn_id)
 
     def test_a_stale_open_turn_does_not_route_another_run_to_the_device(self):
         """D23: a stopped turn never reaches post_llm_call, so T1 stays 'open'. A background review (R9) or a
@@ -332,9 +343,8 @@ class MiddlewareTests(unittest.TestCase):
         self.rt.targets["s-other"] = "mac"
         self.rt.turn_open["s-other"] = True
         try:
-            out = json.loads(forward.tool_execution(tool_name="read_file", args={"path": "/Users/z/a.md"},
-                                                    next_call=lambda a: "LOCAL", session_id="s-other",
-                                                    task_id="t-other"))
+            out = json.loads(through_hermes("read_file", {"path": "/Users/z/a.md"}, lambda a: "LOCAL",
+                                            session_id="s-other", task_id="t-other"))
             self.assertEqual((out["ran_on"], out["session"]), ("device", "s-other"))
         finally:
             self.rt.grants.pop(("s-other", "mac"), None)
@@ -497,9 +507,8 @@ class MiddlewareTests(unittest.TestCase):
             with self.subTest(meta=repr(meta), body=body[:8]):
                 ran = []
                 with mock.patch.object(self.rt, "call_target", return_value=(meta, body)):
-                    out = forward.tool_execution(tool_name="patch", args={"path": "/Users/z/a.md"},
-                                                 next_call=lambda a: ran.append(a) or "H",
-                                                 session_id="default", task_id="t-reply")
+                    out = through_hermes("patch", {"path": "/Users/z/a.md"}, lambda a: ran.append(a) or "H",
+                                         session_id="default", task_id="t-reply")
                 self.assertEqual(ran, [])
                 self.assertIsInstance(out, str)
                 self.assertIn("its result is lost", json.loads(out)["error"])
@@ -585,7 +594,8 @@ class MiddlewareTests(unittest.TestCase):
             self.assertIn("did not run anywhere", unread["error"])
         self.assertFalse(forward._v4a_names("no headers here"))
         self.assertEqual(forward._v4a_names(v4a(dev_file, host_file)), [dev_file, host_file])
-        self.assertEqual(forward._v4a_header_names_regex(v4a(dev_file, host_file)), [dev_file, host_file])
+        # Hermes's reader refuses a header that escapes the workspace: no list, so the patch is refused here too
+        self.assertIsNone(forward._v4a_names(v4a("../outside.txt")))
 
     def test_a_skill_copy_follows_the_turn_it_belongs_to_on_any_thread(self):
         """skill_files is a transform_tool_result hook: Hermes runs it on its own thread, where the tool call's
@@ -702,14 +712,10 @@ class MiddlewareTests(unittest.TestCase):
     def agent_loop(self, name, args, agent=None, call_id="c1"):
         """One tool call through Hermes's real agent-loop runner, with tether's middleware registered as Hermes
         registers it. Returns (result, host_ran): host_ran lists the calls Hermes ran on this host."""
-        from agent.tool_executor import _run_agent_tool_execution_middleware
-        self.plugins._middleware.setdefault("tool_execution", []).append(forward.tool_execution)
         host_ran = []
-        state = _run_agent_tool_execution_middleware(
-            agent or self.agent(), function_name=name, function_args=args, effective_task_id="t1",
-            tool_call_id=call_id, execute=lambda a: host_ran.append(a) or "HOST RAN IT")
-        self.plugins._middleware["tool_execution"].remove(forward.tool_execution)
-        return state.result, host_ran
+        result = through_hermes(name, args, lambda a: host_ran.append(a) or "HOST RAN IT", tool_call_id=call_id,
+                                agent=agent or self.agent())
+        return result, host_ran
 
     def agent(self):
         from agent.tool_guardrails import ToolCallGuardrailController, toolguard_synthetic_result
@@ -807,12 +813,15 @@ class MiddlewareTests(unittest.TestCase):
         self.assertEqual((json.loads(out)["ran_on"], seen), ("device", ["read_file"]))
 
     @unittest.skipUnless(HAVE_HERMES, "Hermes source not importable")
-    def test_transform_tool_result_sees_a_device_result_in_the_agent_loop(self):
+    def test_tether_leaves_transform_tool_result_to_hermes(self):
+        """Hermes applies post_tool_call and transform_tool_result to the result a middleware returns after
+        authorize_tool_call (its own test: tests/agent/test_tool_execution_middleware_authorization.py). tether
+        returns the device's result untouched, so the hook runs once, not twice."""
         def transform(tool_name="", result="", **kw):
             return f"{result} [checked on the host]" if tool_name == "read_file" else None
         self.plugins._hooks.setdefault("transform_tool_result", []).append(transform)
         result, _ = self.agent_loop("read_file", {"path": "/Users/z/a.md"})
-        self.assertTrue(str(result).endswith("[checked on the host]"), result)
+        self.assertNotIn("[checked on the host]", str(result))
         self.assertIn('"ran_on": "device"', str(result))
 
     # ---- F62: vision reads of a file in the host's own Hermes home ----

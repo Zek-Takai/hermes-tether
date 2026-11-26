@@ -11,6 +11,7 @@ import io
 import os
 import shutil
 import socket
+import stat
 import sys
 import tempfile
 import time
@@ -77,11 +78,48 @@ def isolated_plugins(testcase):
     return manager
 
 
+def through_hermes(tool_name, args, next_call, session_id="default", task_id="t1", turn_id="", tool_call_id="c1",
+                   conversation_id="", agent=None):
+    """tether's tool_execution middleware as Hermes runs it: one tool call through Hermes's real agent-loop runner,
+    with the middleware registered on the test's plugin manager for this call only. ``next_call`` stands for the
+    tool run on this host. Returns the result the model gets."""
+    import hermes_cli.plugins as hermes_plugins
+    from agent.tool_executor import _run_agent_tool_execution_middleware
+    from agent.tool_guardrails import ToolCallGuardrailController, toolguard_synthetic_result
+    from tether import forward
+    if agent is None:
+        agent = mock.MagicMock()
+        agent._tool_guardrails = ToolCallGuardrailController()
+        agent._guardrail_block_result = toolguard_synthetic_result
+        agent.tool_progress_callback = agent.clarify_callback = None
+        agent._current_api_request_id = ""
+    agent.session_id, agent._current_turn_id, agent._interrupt_requested = session_id, turn_id, False
+    agent._inherited_conversation_id = conversation_id or session_id
+    chain = hermes_plugins._delivery_manager()._middleware.setdefault("tool_execution", [])
+    chain.append(forward.tool_execution)
+    try:
+        return _run_agent_tool_execution_middleware(
+            agent, function_name=tool_name, function_args=args, effective_task_id=task_id,
+            tool_call_id=tool_call_id, execute=next_call).result
+    finally:
+        chain.remove(forward.tool_execution)
+
+
 def remove_tree(path: Path) -> None:
     """Remove a test's folder. A service or process the test started may still write into it for a moment after the
-    test ends (a log line, a marker), so the removal is retried until nothing is left."""
+    test ends (a log line, a marker), so the removal is retried until nothing is left. Windows will not delete a
+    read-only file or folder: inside the test's own folder that mark is cleared and the removal tried again (never on
+    or through a link)."""
+    def clear_mark(func, p, _exc):
+        try:
+            if not os.path.islink(p):
+                os.chmod(p, stat.S_IWRITE | stat.S_IREAD | (stat.S_IEXEC if os.path.isdir(p) else 0))
+            func(p)
+        except OSError:
+            pass
+    handler = {"onexc": clear_mark} if sys.version_info >= (3, 12) else {"onerror": clear_mark}
     for _ in range(30):
-        shutil.rmtree(path, ignore_errors=True)
+        shutil.rmtree(path, **handler)
         if not path.exists():
             return
         time.sleep(0.1)

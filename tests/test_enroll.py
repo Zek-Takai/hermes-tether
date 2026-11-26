@@ -23,7 +23,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugin" / "tether"))
-sys.path.insert(1, str(Path.home() / ".hermes" / "hermes-agent"))
+sys.path.insert(1, str(Path(os.environ.get("HERMES_AGENT_SRC") or Path.home() / ".hermes" / "hermes-agent")))
 
 from test_link_loopback import FakePrompt, Rig, isolate_session, temp_dir  # noqa: E402
 from tether import authcode, enroll, seedstore as ss  # noqa: E402
@@ -575,7 +575,8 @@ class DeviceTests(unittest.IsolatedAsyncioTestCase):
         import tools.environments.local as local_env
         from tether import lock
         from tether.device_exec import LocalExec
-        with mock.patch.object(local_env, "LocalEnvironment", FakeEnv), mock.patch.object(lock, "_LOCKED_CLASS", None):
+        with mock.patch.object(local_env, "LocalEnvironment", FakeEnv), mock.patch.object(lock, "_LOCKED_CLASS", None), \
+                mock.patch.object(lock, "_check_applied", lambda terminal: None):     # a fake terminal runs nothing
             LocalExec()._env("s1", 30)
         self.assertEqual(made[0]["env"].get(enroll.REMOTE_MARK), "1")
         self.assertIsNone(made[0]["env"].get("TETHER_KEY_PASSPHRASE", "missing"), "the passphrase blank was lost")

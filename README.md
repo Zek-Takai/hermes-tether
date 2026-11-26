@@ -153,8 +153,8 @@ The panel's desktop part ships switched off, like every Hermes plugin's. Turn it
 
 ## Setup
 
-Requires Hermes **0.23.3** on both machines (the release this version is built and tested against), running on
-Hermes's own Python 3.14 runtime as current Hermes installs do (Hermes's older 3.11 environments are only its update
+Requires, on both machines, a Hermes that has the public plugin seams this version uses: [NousResearch/hermes-agent#160267](https://github.com/NousResearch/hermes-agent/pull/160267), [#160268](https://github.com/NousResearch/hermes-agent/pull/160268) and [#160269](https://github.com/NousResearch/hermes-agent/pull/160269). Until they are merged and released, that means a Hermes built from those changes; on a Hermes without them every protection fails closed (the call or command is refused) and the log names the missing seam. Hermes runs on
+its own Python 3.14 runtime as current Hermes installs do (Hermes's older 3.11 environments are only its update
 bridge; Tether's tests pass on both). Install the
 plugin folder `plugin/tether` (and `plugin/tether_screen` for computer use) into each Hermes's `plugins/` folder:
 `~/.hermes/plugins/` on macOS and Linux, `%LOCALAPPDATA%\hermes\plugins\` on Windows.
@@ -218,7 +218,7 @@ join <file> | remove | recovery-codes | unlock`.
 `hermes tether authenticator export` there and `hermes tether authenticator join` on the new one. Every machine
 then asks, in a box on its own screen, for the 6-digit code from the same authenticator app entry, `Hermes Tether`
 (1Password, Proton Pass, Google Authenticator, Microsoft Authenticator or any app that takes a setup key or a QR
-code). A device without an authenticator refuses remote use, so after installing or updating to 0.3.0 set it up
+code). A device without an authenticator refuses remote use, so after installing or updating to 0.3.0 or later set it up
 once, on one machine, in about two minutes, and add the others as below. Do it yourself in a terminal there; it
 refuses to run from an agent's or a remote session's shell, and it takes no code, phrase or key on the command
 line. No system password, administrator or User Account Control dialog is involved: remote use is refused until the
@@ -573,9 +573,9 @@ cd tests && ~/.hermes/hermes-agent/venv/bin/python -m unittest discover -s . -p 
 ```
 
 `hermes plugins validate plugin/tether` passes (manifest, registrations, security scan, no core
-overrides, desktop surface inside the plugin SDK). It lists the plugin's imports of Hermes internals as warnings
-(such as the approval checks, the local terminal environment and the computer-use registry): there
-is no public plugin API for these yet.
+overrides, desktop surface inside the plugin SDK). On a Hermes with the seams above it reports no private
+import: every Hermes name Tether uses is on Hermes's public plugin list. On a Hermes without them it lists those
+names as private imports.
 
 `plugin/tether_screen` is installed by hand next to `plugin/tether` (it is not the catalog entry). Its
 validation stops at the capability probe (`register() raised: register_computer_use_provider`), exactly

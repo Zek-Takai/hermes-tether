@@ -14,7 +14,7 @@ import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugin" / "tether"))
-sys.path.insert(1, str(Path.home() / ".hermes" / "hermes-agent"))     # Hermes itself, for the passphrase tests
+sys.path.insert(1, str(Path(os.environ.get("HERMES_AGENT_SRC") or Path.home() / ".hermes" / "hermes-agent")))     # Hermes itself, for the passphrase tests
 
 from tether import frames, pairing, tlslink  # noqa: E402
 from tether.identity import MemorySecretStore, PASSPHRASE_SECRET, load_or_create  # noqa: E402
@@ -443,7 +443,7 @@ class StartupEnvironmentTests(unittest.TestCase):
         env.update({PASSPHRASE_SECRET: DUMMY_PASSPHRASE, "HERMES_HOME": str(temp_dir(self, "hp-startup-home-")),
                     "PYTHONDONTWRITEBYTECODE": "1"})
         out = subprocess.run([sys.executable, str(script), str(root / "plugin" / "tether"),
-                              str(Path.home() / ".hermes" / "hermes-agent")],
+                              str(Path(os.environ.get("HERMES_AGENT_SRC") or Path.home() / ".hermes" / "hermes-agent"))],
                              env=env, capture_output=True, text=True, timeout=180)
         lines = dict(line.split(" ", 1) for line in out.stdout.splitlines() if line.startswith(("leak-", "seen-")))
         self.assertEqual(lines.get("seen-other"), "True", "the child could not list the start-up environment")

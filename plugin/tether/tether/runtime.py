@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import logging
+import os
 import sys
 import time
 import threading
@@ -30,7 +31,9 @@ REFUSED = ("no longer allowed", "did not allow remote use")   # the device answe
 class BgJob:
     """A background command Hermes started through the tether backend (provider.py). Its poll and stop go to
     ``machine`` (the device it started on, or "local"), never to whatever the session is connected to now.
-    Kept while Hermes still tracks the job as running (``hermes``), at most BG_JOBS_KEEP of them."""
+    A job on this host is kept while its process lives; a device job while its session is connected (then in
+    bg_closed). At most BG_JOBS_KEEP: host records go first, so no session's activity pushes out another session's
+    running device job (gauntlet 3.1 lock F1)."""
     id: str
     machine: str
     session: str
@@ -40,15 +43,20 @@ class BgJob:
     pid: Optional[int] = None
     closed: bool = False     # its device connection closed: it can no longer be checked or stopped from here
     pgid: Optional[int] = None          # a job on "local": its own process group, for the whole-tree stop
-    hermes: Any = None                  # weakref to Hermes's ProcessSession for this job (None: not known)
     away_since: Optional[float] = None  # when its device stopped answering while still connected (D15)
 
     def finished(self) -> bool:
-        """Hermes no longer tracks this job (it saw it end, stopped it, or dropped it): it sends nothing more for it."""
-        if self.hermes is None:
+        """A job on this host whose process is gone: Hermes's poller has seen it end, or will on its next read from
+        its exit file, which needs no record. A device job is never judged here (its session's close moves it)."""
+        if self.machine != "local" or self.pid is None:
             return False
-        session = self.hermes()
-        return session is None or bool(getattr(session, "exited", False))
+        try:
+            os.kill(self.pid, 0)
+        except ProcessLookupError:
+            return True
+        except OSError:                 # exists, owned by someone else: not ended
+            return False
+        return False
 
 
 class Runtime:
@@ -393,8 +401,9 @@ class Runtime:
         with self._bg_lock:
             self._bg_prune_locked()
             self.bg_jobs[job.id] = job
-            while len(self.bg_jobs) > BG_JOBS_KEEP:     # the oldest goes; Hermes's later call for it is refused
-                self.bg_jobs.pop(next(iter(self.bg_jobs)), None)
+            while len(self.bg_jobs) > BG_JOBS_KEEP:     # the oldest host record first; a device job only last
+                victim = next((j for j, r in self.bg_jobs.items() if r.machine == "local"), None)
+                self.bg_jobs.pop(victim if victim is not None else next(iter(self.bg_jobs)), None)
 
     def _bg_prune_locked(self) -> None:
         """Drops the records of jobs Hermes no longer tracks (call with _bg_lock held)."""
